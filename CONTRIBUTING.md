@@ -37,7 +37,7 @@ must tick the legal attestation checkbox in the pull request template.
 - Add or update documentation when behaviour changes.
 - Use only nanoPRC's public API (`prc_api.h`), so the tools build against any nanoPRC checkout.
 - **Before opening a pull request, run the C99 check:**
-  `python tests/check_c99.py --nanoprc /path/to/nanoPRC --build-dir build` (exit 0 = clean).
+  `python tests/check_c99.py --nanoprc /path/to/nanoPRC` (exit 0 = clean).
   MSVC's C mode accepts constructs C99 removed, so a green Windows build is not evidence of
   conformance.
 

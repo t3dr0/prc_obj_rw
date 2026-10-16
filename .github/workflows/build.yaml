@@ -1,0 +1,84 @@
+name: build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      nanoprc_ref:
+        description: nanoPRC branch, tag or commit to build against
+        default: main
+
+env:
+  NANOPRC_REPO: mvrhel/nanoPRC
+  NANOPRC_REF: ${{ github.event.inputs.nanoprc_ref || 'main' }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout prc_obj_rw
+        uses: actions/checkout@v5
+        with:
+          path: prc_obj_rw
+          submodules: recursive
+
+      # nanoPRC is checked out beside this repository, never inside it. Only
+      # its zlib submodule is needed: SDL, imgui and MatrixUtil serve its demos.
+      - name: Checkout nanoPRC
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.NANOPRC_REPO }}
+          ref: ${{ env.NANOPRC_REF }}
+          path: nanoPRC
+
+      - name: Fetch nanoPRC's zlib submodule
+        run: git -C nanoPRC submodule update --init --depth 1 thirdparty/zlib
+
+      - name: Configure
+        run: cmake -S prc_obj_rw -B build -DNANOPRC_SOURCE_DIR="$GITHUB_WORKSPACE/nanoPRC" -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Round-trip a cube, OBJ to PRC and PDF and back
+        run: |
+          set -euo pipefail
+          if [ -d build/bin/Release ]; then bin=build/bin/Release; else bin=build/bin; fi
+          out=roundtrip
+          mkdir -p "$out"
+          "$bin/nano_prc_obj_import" prc_obj_rw/tests/data/cube.obj "$out/cube.prc" "$out/cube.pdf"
+          "$bin/nano_prc_obj_export" "$out/cube.pdf" "$out/back.obj"
+          faces=$(grep -c '^f ' "$out/back.obj")
+          echo "triangles read back: $faces"
+          test "$faces" -eq 12
+
+  c99:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout prc_obj_rw
+        uses: actions/checkout@v5
+        with:
+          path: prc_obj_rw
+          submodules: recursive
+
+      - name: Checkout nanoPRC
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.NANOPRC_REPO }}
+          ref: ${{ env.NANOPRC_REF }}
+          path: nanoPRC
+
+      - name: Strict C99 check
+        run: python3 prc_obj_rw/tests/check_c99.py --nanoprc nanoPRC -v

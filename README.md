@@ -59,7 +59,7 @@ cmake --build build --config Release
 Both tools are C99. Before opening a pull request, run the C99 check:
 
 ```
-python tests/check_c99.py --nanoprc /path/to/nanoPRC --build-dir build
+python tests/check_c99.py --nanoprc /path/to/nanoPRC
 ```
 
 ## Licence
