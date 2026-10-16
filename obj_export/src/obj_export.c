@@ -161,12 +161,14 @@ static void process_and_write_obj_triangle(FILE* obj_out, prc_api_vertex v1, prc
     fprintf(obj_out, "v %f %f %f\n", v3.position[0], v3.position[1], v3.position[2]);
     *v_count += 3;
 
-    /* 2. Write texture coordinates only if explicitly available */
+    /* 2. Write texture coordinates only if explicitly available. nanoPRC's reader
+     *    returns v flipped (1 - v, for image rows stored top first); OBJ, like the
+     *    PRC file itself, counts v from the bottom of the image, so flip it back. */
     if (has_uv)
     {
-        fprintf(obj_out, "vt %f %f\n", v1.uv[0], v1.uv[1]);
-        fprintf(obj_out, "vt %f %f\n", v2.uv[0], v2.uv[1]);
-        fprintf(obj_out, "vt %f %f\n", v3.uv[0], v3.uv[1]);
+        fprintf(obj_out, "vt %f %f\n", v1.uv[0], 1.0f - v1.uv[1]);
+        fprintf(obj_out, "vt %f %f\n", v2.uv[0], 1.0f - v2.uv[1]);
+        fprintf(obj_out, "vt %f %f\n", v3.uv[0], 1.0f - v3.uv[1]);
         *vt_count += 3;
     }
 
