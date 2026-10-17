@@ -42,7 +42,7 @@
  * Usage:
  *     nano_prc_obj_import <input.obj> [output.prc] [output.pdf]
  *                         [--triangles] [--no-normals] [--no-materials]
- *                         [--jitter F]
+ *                         [--jitter F] [--quant-tolerance F]
  *
  * Output paths default to the input's name with .obj replaced.
  *
@@ -60,6 +60,13 @@
 #include <math.h>
 
 #define OBJ_NO_INDEX 0xFFFFFFFFu
+
+/* Quantization tolerance of a compressed tessellation, as a fraction of the
+   bounding-box diagonal: the write API's own default. Some small meshes give
+   an empty model tree in Adobe Acrobat at one tolerance and open at another
+   (a 4-triangle flat strip fails at 1e-6 and opens at 6.83e-6; a 3-triangle
+   one does the reverse), so --quant-tolerance is there to try another. */
+#define OBJ_IMPORT_QUANT_TOLERANCE 1e-6
 
 /* -------------------------------------------------------------------- */
 /* Small growable array of uint32_t                                      */
@@ -433,7 +440,11 @@ usage(const char *prog)
         "  --jitter F      move each part by its own offset of up to F times the\n"
         "                  model diagonal, against an Acrobat defect where some\n"
         "                  layouts of parts give an empty model tree. Default 1e-4;\n"
-        "                  0 turns it off; some layouts in a line need 5e-4.\n", prog);
+        "                  0 turns it off; some layouts in a line need 5e-4.\n"
+        "  --quant-tolerance F\n"
+        "                  compressed tessellations' quantization tolerance, as a\n"
+        "                  fraction of the bounding-box diagonal (default %g)\n",
+        prog, OBJ_IMPORT_QUANT_TOLERANCE);
 }
 
 int
@@ -452,6 +463,7 @@ main(int argc, char *argv[])
        once each part was moved by up to 1e-4 of the model diagonal. Datalogics
        found the same, and that some layouts in a line need up to 5e-4. */
     double jitter = 1e-4;
+    double quant_tolerance = OBJ_IMPORT_QUANT_TOLERANCE;
 
     fastObjMesh *mesh = NULL;
     prc_context *ctx = NULL;
@@ -489,6 +501,15 @@ main(int argc, char *argv[])
             ignore_materials = 1;
         else if (strcmp(argv[a], "--jitter") == 0 && a + 1 < argc)
             jitter = atof(argv[++a]);
+        else if (strcmp(argv[a], "--quant-tolerance") == 0 && a + 1 < argc)
+        {
+            quant_tolerance = atof(argv[++a]);
+            if (!(quant_tolerance > 0.0))
+            {
+                usage(argv[0]);
+                return 1;
+            }
+        }
         else if (argv[a][0] == '-' && argv[a][1] == '-')
         {
             usage(argv[0]);
@@ -752,6 +773,8 @@ main(int argc, char *argv[])
                 }
             }
         }
+        if (t->kind == PRC_API_WRITE_TESS_KIND_COMPRESSED)
+            t->tolerance = prc_write_tol_relative(quant_tolerance);
         t->face_tri_counts = &s->face_tri_count;
         t->num_faces = 1;
         if (has_normals)

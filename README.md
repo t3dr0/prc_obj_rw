@@ -15,6 +15,7 @@ tools built on nanoPRC's public C API:
 ```
 nano_prc_obj_import <input.obj> [output.prc] [output.pdf]
                     [--triangles] [--no-normals] [--no-materials] [--jitter F]
+                    [--quant-tolerance F]
 ```
 
 - Polygons with more than three corners are triangulated by ear clipping, which handles non-convex
@@ -29,6 +30,11 @@ nano_prc_obj_import <input.obj> [output.prc] [output.pdf]
 - Each part is moved by a tiny offset of its own (`--jitter`, default 1e-4 of the model diagonal).
   Some arrangements of separate parts, such as parts along one axis, otherwise give an empty model
   tree in Adobe Acrobat.
+- Some small compressed meshes give an empty model tree in Adobe Acrobat although nanoPRC reads them
+  back correctly; which ones depends on the exact encoding, not on any simple property of the mesh.
+  If a file comes up empty, write it again with `--triangles`, which has always opened, or with
+  another `--quant-tolerance` (the compressed encoding's tolerance as a fraction of the bounding-box
+  diagonal, default `1e-6`).
 
 OBJ parsing uses [fast_obj](https://github.com/thisistherk/fast_obj) (MIT), pinned to `v1.3` as a
 git submodule.
