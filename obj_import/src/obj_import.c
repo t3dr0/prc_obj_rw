@@ -29,11 +29,9 @@
  *   - each MTL material becomes the item's colour, opacity and shininess,
  *     and a map_Kd image in PNG or JPEG becomes its diffuse texture.
  *
- * Geometry goes out as compressed tessellation by default. Two kinds of
- * part are written as plain triangles instead: a textured part, because the
- * compressed encoder has no texture path, and a part with a vertex shared
- * by disconnected triangle fans, which some Acrobat builds misread when
- * compressed. --triangles writes everything that way.
+ * Geometry goes out as compressed tessellation by default. A textured part
+ * is written as plain triangles instead, because the compressed encoder has
+ * no texture path. --triangles writes everything that way.
  *
  * Usage:
  *     nano_prc_obj_import <input.obj> [output.prc] [output.pdf]
@@ -235,9 +233,6 @@ typedef struct
     uint32_t *tex_indices;
     uint32_t  face_tri_count;
     double    bbox_min[3], bbox_max[3];
-    /* From prc_api_mesh_weld_and_split, owned by the write context */
-    double   *split_positions;
-    uint32_t *split_indices;
     uint8_t  *texture_bytes;
     size_t    texture_size;
     uint32_t  texture_format;
@@ -426,8 +421,7 @@ usage(const char *prog)
         "Usage: %s <input.obj> [output.prc] [output.pdf] [options]\n"
         "  Writes the OBJ (and its MTL materials and PNG/JPEG diffuse maps) as PRC.\n"
         "  --triangles     write uncompressed triangles for every part (default:\n"
-        "                  compressed, except textured parts and parts with a\n"
-        "                  vertex shared by disconnected fans, which are\n"
+        "                  compressed, except textured parts, which are\n"
         "                  written as triangles).\n"
         "  --no-normals    ignore the file's vn normals (the reader computes them)\n"
         "  --no-materials  ignore the MTL file (no colours, no textures)\n"
@@ -446,8 +440,6 @@ main(int argc, char *argv[])
     char *prc_default = NULL, *pdf_default = NULL;
     int force_triangles = 0, ignore_normals = 0, ignore_materials = 0;
     int a, rc = 1;
-    prc_write_tolerance tol = prc_write_tol_relative(1e-6);
-    uint32_t nonmanifold_parts = 0;
     double quant_tolerance = OBJ_IMPORT_QUANT_TOLERANCE;
 
     fastObjMesh *mesh = NULL;
@@ -718,40 +710,6 @@ main(int argc, char *argv[])
         t->tri_indices = s->tri_indices;
         t->num_triangles = s->face_tri_count;
 
-        /* A vertex shared by disconnected triangle fans is decoded correctly
-           by our reader but not by some Acrobat builds when written
-           compressed. The write API's own guidance is to write such a mesh
-           as triangles instead, repaired by prc_api_mesh_weld_and_split. */
-        if (t->kind == PRC_API_WRITE_TESS_KIND_COMPRESSED)
-        {
-            int nm = prc_api_mesh_has_nonmanifold_fans(ctx, s->positions, s->num_positions,
-                s->tri_indices, s->face_tri_count, tol);
-
-            if (nm < 0)
-            {
-                prc_api_print_error_stack(ctx);
-                goto done;
-            }
-            if (nm == 1)
-            {
-                t->kind = PRC_API_WRITE_TESS_KIND_TRIANGLES;
-                nonmanifold_parts++;
-                if (!has_normals)
-                {
-                    if (prc_api_mesh_weld_and_split(ctx, s->positions, s->num_positions,
-                            s->tri_indices, s->face_tri_count, tol,
-                            &s->split_positions, &t->num_positions,
-                            &s->split_indices, &s->face_tri_count) != 0)
-                    {
-                        prc_api_print_error_stack(ctx);
-                        goto done;
-                    }
-                    t->positions = s->split_positions;
-                    t->tri_indices = s->split_indices;
-                    t->num_triangles = s->face_tri_count;
-                }
-            }
-        }
         if (t->kind == PRC_API_WRITE_TESS_KIND_COMPRESSED)
             t->tolerance = prc_write_tol_relative(quant_tolerance);
         t->face_tri_counts = &s->face_tri_count;
@@ -879,11 +837,10 @@ main(int argc, char *argv[])
             if (tess[i].kind == PRC_API_WRITE_TESS_KIND_COMPRESSED) compressed++;
         }
         printf("Wrote %s (%lu bytes) and %s: %u parts, %u tessellations "
-               "(%u compressed, %u textured, %u written as triangles for non-manifold "
-               "fans), %u triangles; %u polygons triangulated, %u degenerate faces skipped\n",
+               "(%u compressed, %u textured), %u triangles; %u polygons triangulated, "
+               "%u degenerate faces skipped\n",
                prc_path, (unsigned long)prc_size, pdf_path, root.num_children, num_subs,
-               compressed, textured, nonmanifold_parts, total_tris, polygons_split,
-               degenerate_skipped);
+               compressed, textured, total_tris, polygons_split, degenerate_skipped);
     }
     rc = 0;
 
@@ -892,10 +849,6 @@ done:
     {
         if (prc_buf != NULL)
             prc_api_write_prc_buffer_free(ctx, prc_buf);
-        if (subs != NULL)
-            for (i = 0; i < num_subs; i++)
-                prc_api_mesh_weld_and_split_free(ctx, subs[i].split_positions,
-                                                 subs[i].split_indices);
         prc_api_release_context(ctx);
     }
     if (subs != NULL)

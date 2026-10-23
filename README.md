@@ -24,9 +24,8 @@ nano_prc_obj_import <input.obj> [output.prc] [output.pdf]
   one tessellation per material.
 - MTL diffuse colour (`Kd`), opacity (`d`) and shininess (`Ns`) become the PRC material. A `map_Kd`
   image in PNG or JPEG becomes a diffuse texture.
-- Geometry is written as PRC compressed tessellation where possible. Textured parts, and parts with a
-  vertex shared by disconnected triangle fans, are written as plain triangles, because compressed
-  tessellation cannot carry textures and some Adobe Acrobat builds misread that vertex case.
+- Geometry is written as PRC compressed tessellation where possible. Textured parts are written as
+  plain triangles, because compressed tessellation cannot carry textures.
 - `--quant-tolerance` sets the compressed encoding's tolerance as a fraction of the bounding-box
   diagonal (default `1e-6`).
 - Build against a nanoPRC that includes its pull requests #153, #157 and #168. Older versions can
