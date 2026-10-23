@@ -35,14 +35,10 @@
  * by disconnected triangle fans, which some Acrobat builds misread when
  * compressed. --triangles writes everything that way.
  *
- * Each part is also moved by its own tiny offset (--jitter, default 1e-4 of
- * the model diagonal): some layouts of separate parts, such as parts along
- * one axis, otherwise give an empty model tree in Acrobat.
- *
  * Usage:
  *     nano_prc_obj_import <input.obj> [output.prc] [output.pdf]
  *                         [--triangles] [--no-normals] [--no-materials]
- *                         [--jitter F] [--quant-tolerance F]
+ *                         [--quant-tolerance F]
  *
  * Output paths default to the input's name with .obj replaced.
  *
@@ -62,10 +58,8 @@
 #define OBJ_NO_INDEX 0xFFFFFFFFu
 
 /* Quantization tolerance of a compressed tessellation, as a fraction of the
-   bounding-box diagonal: the write API's own default. Some small meshes give
-   an empty model tree in Adobe Acrobat at one tolerance and open at another
-   (a 4-triangle flat strip fails at 1e-6 and opens at 6.83e-6; a 3-triangle
-   one does the reverse), so --quant-tolerance is there to try another. */
+   bounding-box diagonal: the write API's own default. --quant-tolerance
+   changes it. */
 #define OBJ_IMPORT_QUANT_TOLERANCE 1e-6
 
 /* -------------------------------------------------------------------- */
@@ -437,10 +431,6 @@ usage(const char *prog)
         "                  written as triangles).\n"
         "  --no-normals    ignore the file's vn normals (the reader computes them)\n"
         "  --no-materials  ignore the MTL file (no colours, no textures)\n"
-        "  --jitter F      move each part by its own offset of up to F times the\n"
-        "                  model diagonal, against an Acrobat defect where some\n"
-        "                  layouts of parts give an empty model tree. Default 1e-4;\n"
-        "                  0 turns it off; some layouts in a line need 5e-4.\n"
         "  --quant-tolerance F\n"
         "                  compressed tessellations' quantization tolerance, as a\n"
         "                  fraction of the bounding-box diagonal (default %g)\n",
@@ -458,11 +448,6 @@ main(int argc, char *argv[])
     int a, rc = 1;
     prc_write_tolerance tol = prc_write_tol_relative(1e-6);
     uint32_t nonmanifold_parts = 0;
-    /* On by default: measured on 16 October 2026, three files whose parts lie
-       along one axis gave an empty model tree in Acrobat, and all rendered
-       once each part was moved by up to 1e-4 of the model diagonal. Datalogics
-       found the same, and that some layouts in a line need up to 5e-4. */
-    double jitter = 1e-4;
     double quant_tolerance = OBJ_IMPORT_QUANT_TOLERANCE;
 
     fastObjMesh *mesh = NULL;
@@ -499,8 +484,6 @@ main(int argc, char *argv[])
             ignore_normals = 1;
         else if (strcmp(argv[a], "--no-materials") == 0)
             ignore_materials = 1;
-        else if (strcmp(argv[a], "--jitter") == 0 && a + 1 < argc)
-            jitter = atof(argv[++a]);
         else if (strcmp(argv[a], "--quant-tolerance") == 0 && a + 1 < argc)
         {
             quant_tolerance = atof(argv[++a]);
@@ -710,10 +693,6 @@ main(int argc, char *argv[])
             else
             {
                 want_texture = 1;
-                if (s->texture_format == PRC_API_WRITE_TEXTURE_PNG && tw >= 256 && th >= 256)
-                    fprintf(stderr, "warning: %s is a PNG of %ux%u; a PNG of 256 or more on both "
-                            "axes currently gives an empty model tree in Acrobat. JPEG does not.\n",
-                            img, tw, th);
             }
         }
 
@@ -820,51 +799,6 @@ main(int argc, char *argv[])
         total_tris += s->face_tri_count;
     }
 
-    /* Optional jitter: move each tessellation rigidly by its own tiny offset.
-       Some layouts of separate parts -- in a line, or on a lattice -- give an
-       empty model tree in Acrobat, with no rule known for which; displacing
-       every part slightly and differently avoids it (Datalogics, 17 August
-       2026). Offsets come from frac((i+1) * a) with an irrational a per axis,
-       so no two parts move by the same vector. */
-    if (jitter > 0.0)
-    {
-        static const double alpha[3] = { 0.6180339887498949, 0.4142135623730951, 0.7320508075688772 };
-        double lo[3], hi[3], diag;
-        uint32_t d, v;
-
-        for (d = 0; d < 3; d++)
-        {
-            lo[d] = subs[0].bbox_min[d];
-            hi[d] = subs[0].bbox_max[d];
-        }
-        for (i = 1; i < num_subs; i++)
-            for (d = 0; d < 3; d++)
-            {
-                if (subs[i].bbox_min[d] < lo[d]) lo[d] = subs[i].bbox_min[d];
-                if (subs[i].bbox_max[d] > hi[d]) hi[d] = subs[i].bbox_max[d];
-            }
-        diag = sqrt((hi[0] - lo[0]) * (hi[0] - lo[0]) + (hi[1] - lo[1]) * (hi[1] - lo[1]) +
-                    (hi[2] - lo[2]) * (hi[2] - lo[2]));
-
-        for (i = 0; i < num_subs; i++)
-        {
-            double *pos = subs[i].split_positions ? subs[i].split_positions : subs[i].positions;
-            double off[3];
-
-            for (d = 0; d < 3; d++)
-            {
-                double f = (double)(i + 1) * alpha[d];
-
-                off[d] = jitter * diag * 2.0 * ((f - floor(f)) - 0.5);
-                subs[i].bbox_min[d] += off[d];
-                subs[i].bbox_max[d] += off[d];
-            }
-            for (v = 0; v < tess[i].num_positions; v++)
-                for (d = 0; d < 3; d++)
-                    pos[v * 3 + d] += off[d];
-        }
-    }
-
     /* Tree: one root, one child node per part, each holding its submeshes. */
     memset(&root, 0, sizeof(root));
     for (k = 0; k < num_parts; k++)
@@ -906,8 +840,8 @@ main(int argc, char *argv[])
         }
         children[root.num_children++] = node;
     }
-    /* The root is an empty part; its box must be real, not zero, or Acrobat
-       blanks the tree beneath it. */
+    /* The root is an empty part. Its box is still written, so it is given the
+       union of its children's boxes. */
     root.has_empty_part = 1;
     root.children = children;
 

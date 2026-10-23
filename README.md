@@ -14,7 +14,7 @@ tools built on nanoPRC's public C API:
 
 ```
 nano_prc_obj_import <input.obj> [output.prc] [output.pdf]
-                    [--triangles] [--no-normals] [--no-materials] [--jitter F]
+                    [--triangles] [--no-normals] [--no-materials]
                     [--quant-tolerance F]
 ```
 
@@ -27,14 +27,12 @@ nano_prc_obj_import <input.obj> [output.prc] [output.pdf]
 - Geometry is written as PRC compressed tessellation where possible. Textured parts, and parts with a
   vertex shared by disconnected triangle fans, are written as plain triangles, because compressed
   tessellation cannot carry textures and some Adobe Acrobat builds misread that vertex case.
-- Each part is moved by a tiny offset of its own (`--jitter`, default 1e-4 of the model diagonal).
-  Some arrangements of separate parts, such as parts along one axis, otherwise give an empty model
-  tree in Adobe Acrobat.
-- Some small compressed meshes give an empty model tree in Adobe Acrobat although nanoPRC reads them
-  back correctly; which ones depends on the exact encoding, not on any simple property of the mesh.
-  If a file comes up empty, write it again with `--triangles`, which has always opened, or with
-  another `--quant-tolerance` (the compressed encoding's tolerance as a fraction of the bounding-box
-  diagonal, default `1e-6`).
+- `--quant-tolerance` sets the compressed encoding's tolerance as a fraction of the bounding-box
+  diagonal (default `1e-6`).
+- Build against a nanoPRC that includes its pull requests #153, #157 and #168. Older versions can
+  write files that Adobe Acrobat shows with an empty model tree, depending on where a section of the
+  file happens to end; that is why earlier versions of this tool moved parts slightly and suggested
+  trying another tolerance.
 
 OBJ parsing uses [fast_obj](https://github.com/thisistherk/fast_obj) (MIT), pinned to `v1.3` as a
 git submodule.
