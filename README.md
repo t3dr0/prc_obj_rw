@@ -22,10 +22,15 @@ nano_prc_obj_import <input.obj> [output.prc] [output.pdf]
   polygons correctly.
 - Each OBJ object (or group, if the file has no objects) becomes a part in the PRC model tree, with
   one tessellation per material.
-- MTL diffuse colour (`Kd`), opacity (`d`) and shininess (`Ns`) become the PRC material. A `map_Kd`
-  image in PNG or JPEG becomes a diffuse texture.
-- Geometry is written as PRC compressed tessellation where possible. Textured parts are written as
-  plain triangles, because compressed tessellation cannot carry textures.
+- MTL diffuse colour (`Kd`), opacity (`d`) and shininess (`Ns`) become the PRC material, and so do
+  the ambient, specular and emissive colours (`Ka`, `Ks`, `Ke`) when the MTL gives them.
+- A `map_Kd` image in PNG or JPEG becomes a diffuse texture, placed by the map's `-s` and `-o`
+  options and clamped by `-clamp on`. A `map_d` image becomes an opacity mask and a
+  `refl -type sphere` image a reflection (at the strength `Ks` gives), each applied after the
+  diffuse texture, or on its own when there is none. Other map options are ignored, and map types
+  PRC has no place for (bump, specular, emissive, cube reflections) are left out.
+- Geometry is written as PRC compressed tessellation, textured or not. `--triangles` writes plain
+  triangles instead.
 - `--quant-tolerance` sets the compressed encoding's tolerance as a fraction of the bounding-box
   diagonal (default `1e-6`).
 - Build against a nanoPRC that includes its pull requests #153, #157 and #168. Older versions can

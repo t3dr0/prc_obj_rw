@@ -26,12 +26,20 @@
  *   - the mesh is split into parts, one per OBJ object (or group, when the
  *     file has no objects), and each part into one tessellation per
  *     material, since a PRC representation item carries one material;
- *   - each MTL material becomes the item's colour, opacity and shininess,
- *     and a map_Kd image in PNG or JPEG becomes its diffuse texture.
+ *   - each MTL material becomes the item's material: Kd its colour, d its
+ *     opacity, Ns its shininess, and Ka, Ks and Ke its ambient, specular and
+ *     emissive colours when the MTL gives them;
+ *   - a map_Kd image in PNG or JPEG becomes the item's diffuse texture,
+ *     placed by the map's -s and -o options and clamped by -clamp on; a
+ *     map_d image becomes an opacity layer and a "refl -type sphere" image a
+ *     reflection layer after it, or the item's only texture when there is
+ *     no map_Kd.
  *
- * Geometry goes out as compressed tessellation by default. A textured part
- * is written as plain triangles instead, because the compressed encoder has
- * no texture path. --triangles writes everything that way.
+ * fast_obj v1.3 ignores a map line that has options and never reads refl,
+ * so the MTL files are read a second time here for those (read_mtl_extras).
+ *
+ * Geometry goes out as compressed tessellation, textured or not.
+ * --triangles writes every part as plain triangles instead.
  *
  * Usage:
  *     nano_prc_obj_import <input.obj> [output.prc] [output.pdf]
@@ -40,8 +48,8 @@
  *
  * Output paths default to the input's name with .obj replaced.
  *
- * Not yet done: instancing of repeated parts, texture de-duplication,
- * units, map_d and emissive colour.
+ * Not yet done: instancing of repeated parts, units, and the map types
+ * PRC has no place for (bump, specular, emissive and cube reflection maps).
  * ==================================================================== */
 
 #include <prc_api.h>
@@ -236,6 +244,11 @@ typedef struct
     uint8_t  *texture_bytes;
     size_t    texture_size;
     uint32_t  texture_format;
+
+    /* Layers after the main texture: an opacity mask and a reflection */
+    prc_api_write_texture_layer layers[2];
+    uint8_t  *layer_bytes[2];
+    uint32_t  num_layers;
 } submesh;
 
 static void
@@ -245,6 +258,7 @@ submesh_free(submesh *s)
     free(s->positions); free(s->normals); free(s->tex_coords);
     free(s->tri_indices); free(s->norm_indices); free(s->tex_indices);
     free(s->texture_bytes);
+    free(s->layer_bytes[0]); free(s->layer_bytes[1]);
 }
 
 /* Compact one fast_obj attribute stream: every index used by the submesh is
@@ -338,6 +352,408 @@ image_format(const uint8_t *b, size_t n, uint32_t *format, uint32_t *w, uint32_t
     return -1;
 }
 
+/* Read a texture image and check that it is PNG or JPEG. `what` names the
+   map in the warning given when it is missing or of another kind. */
+static int
+load_image(const char *path, const char *what, uint8_t **bytes, size_t *size,
+    uint32_t *format, uint32_t *w, uint32_t *h)
+{
+    if (read_file(path, bytes, size) != 0)
+    {
+        fprintf(stderr, "warning: %s %s not found, left out\n", what, path);
+        return -1;
+    }
+    if (image_format(*bytes, *size, format, w, h) != 0)
+    {
+        fprintf(stderr, "warning: %s %s is not PNG or JPEG, left out\n", what, path);
+        free(*bytes);
+        *bytes = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+/* -------------------------------------------------------------------- */
+/* What fast_obj does not read from the MTL                              */
+/* -------------------------------------------------------------------- */
+
+/* One texture map line: its image, and the options PRC can carry. */
+typedef struct
+{
+    char  *path;            /* NULL when the material has no such map */
+    double scale[2];        /* -s u v; 1 1 when not given */
+    double offset[2];       /* -o u v; 0 0 when not given */
+    int    clamp;           /* -clamp on */
+    int    placed;          /* the line gave -s, -o or -clamp */
+} map_line;
+
+/* Per material: which colours the MTL actually gives (fast_obj fills the
+   others with zeros, so it cannot tell black from absent), and the maps. */
+typedef struct
+{
+    char    *name;
+    int      has_Ka, has_Ks, has_Ke, has_Ns;
+    map_line map_Kd, map_d, refl;
+} mtl_extra;
+
+typedef struct
+{
+    mtl_extra *items;
+    uint32_t   count;
+    uint32_t   capacity;
+} mtl_extras;
+
+/* Read one line of any length into *buf, without its line ending. Returns 1
+   for a line, 0 at the end of the file, -1 if out of memory. */
+static int
+read_line(FILE *f, char **buf, size_t *cap)
+{
+    size_t len = 0;
+    int c;
+
+    if (*buf == NULL)
+    {
+        *cap = 256;
+        *buf = (char *)malloc(*cap);
+        if (*buf == NULL)
+            return -1;
+    }
+    while ((c = fgetc(f)) != EOF && c != '\n')
+    {
+        if (len + 1 >= *cap)
+        {
+            char *grown = (char *)realloc(*buf, *cap * 2);
+
+            if (grown == NULL)
+                return -1;
+            *buf = grown;
+            *cap *= 2;
+        }
+        (*buf)[len++] = (char)c;
+    }
+    if (c == EOF && len == 0)
+        return 0;
+    if (len > 0 && (*buf)[len - 1] == '\r')
+        len--;
+    (*buf)[len] = '\0';
+    return 1;
+}
+
+static const char *
+skip_blanks(const char *p)
+{
+    while (*p == ' ' || *p == '\t')
+        p++;
+    return p;
+}
+
+/* If the line at p starts with the keyword kw followed by a blank or the end
+   of the line, return what follows it; otherwise NULL. */
+static const char *
+after_keyword(const char *p, const char *kw)
+{
+    size_t n = strlen(kw);
+
+    p = skip_blanks(p);
+    if (strncmp(p, kw, n) != 0 || (p[n] != ' ' && p[n] != '\t' && p[n] != '\0'))
+        return NULL;
+    return skip_blanks(p + n);
+}
+
+/* A copy of `base` followed by the rest of the line at p without trailing
+   blanks: how fast_obj reads names and file names, spaces included. */
+static char *
+rest_of_line(const char *base, const char *p)
+{
+    size_t nb = strlen(base), n;
+    char *out;
+
+    p = skip_blanks(p);
+    n = strlen(p);
+    while (n > 0 && (p[n - 1] == ' ' || p[n - 1] == '\t'))
+        n--;
+    if (n == 0)
+        return NULL;
+    out = (char *)malloc(nb + n + 1);
+    if (out == NULL)
+        return NULL;
+    memcpy(out, base, nb);
+    memcpy(out + nb, p, n);
+    out[nb + n] = '\0';
+    return out;
+}
+
+/* Read up to `max` numbers at p into v (if not NULL); returns how many. */
+static int
+read_numbers(const char **p, double *v, int max)
+{
+    int k = 0;
+
+    while (k < max)
+    {
+        const char *s = skip_blanks(*p);
+        char *e;
+        double x = strtod(s, &e);
+
+        if (e == s || (*e != ' ' && *e != '\t' && *e != '\0'))
+            break;
+        if (v != NULL)
+            v[k] = x;
+        k++;
+        *p = e;
+    }
+    return k;
+}
+
+/* Skip one word at p. */
+static void
+skip_word(const char **p)
+{
+    const char *s = skip_blanks(*p);
+
+    while (*s != '\0' && *s != ' ' && *s != '\t')
+        s++;
+    *p = s;
+}
+
+/* Parse the rest of a map line: options, then the file name. Only -s, -o,
+   -clamp and -type are kept; the others are skipped with their arguments.
+   `type` receives the -type value's first letters ("sphere" or "cube..."),
+   for refl. Returns -1 if there is no file name. */
+static int
+parse_map(const char *p, const char *base, map_line *m, char *type, size_t type_size)
+{
+    m->scale[0] = m->scale[1] = 1.0;
+    m->offset[0] = m->offset[1] = 0.0;
+    m->clamp = 0;
+    m->placed = 0;
+    if (type != NULL && type_size > 0)
+        type[0] = '\0';
+
+    for (;;)
+    {
+        const char *o = skip_blanks(p);
+        const char *v;
+        double xyz[3];
+
+        if (*o != '-')
+            break;
+        if ((v = after_keyword(o, "-s")) != NULL || (v = after_keyword(o, "-o")) != NULL)
+        {
+            int is_scale = (o[1] == 's');
+            int k;
+
+            p = v;
+            k = read_numbers(&p, xyz, 3);
+            if (k >= 1)
+            {
+                double *dst = is_scale ? m->scale : m->offset;
+
+                m->placed = 1;
+                dst[0] = xyz[0];
+                /* One number scales or moves u only; v keeps its default. */
+                if (k >= 2)
+                    dst[1] = xyz[1];
+            }
+        }
+        else if ((v = after_keyword(o, "-t")) != NULL)
+        {
+            p = v;
+            read_numbers(&p, NULL, 3);
+        }
+        else if ((v = after_keyword(o, "-clamp")) != NULL)
+        {
+            m->clamp = (strncmp(v, "on", 2) == 0);
+            m->placed = 1;
+            p = v;
+            skip_word(&p);
+        }
+        else if ((v = after_keyword(o, "-type")) != NULL)
+        {
+            size_t k = 0;
+
+            while (type != NULL && k + 1 < type_size && v[k] != '\0' && v[k] != ' ' && v[k] != '\t')
+            {
+                type[k] = v[k];
+                k++;
+            }
+            if (type != NULL && type_size > 0)
+                type[k] = '\0';
+            p = v;
+            skip_word(&p);
+        }
+        else if ((v = after_keyword(o, "-mm")) != NULL)
+        {
+            p = v;
+            read_numbers(&p, NULL, 2);
+        }
+        else if ((v = after_keyword(o, "-blendu")) != NULL || (v = after_keyword(o, "-blendv")) != NULL ||
+                 (v = after_keyword(o, "-cc")) != NULL || (v = after_keyword(o, "-bm")) != NULL ||
+                 (v = after_keyword(o, "-boost")) != NULL || (v = after_keyword(o, "-texres")) != NULL ||
+                 (v = after_keyword(o, "-imfchan")) != NULL)
+        {
+            p = v;
+            skip_word(&p);
+        }
+        else
+        {
+            /* Not a known option: take it as the start of the file name. */
+            break;
+        }
+    }
+
+    free(m->path);
+    m->path = rest_of_line(base, p);
+    return m->path != NULL ? 0 : -1;
+}
+
+static void
+mtl_extras_free(mtl_extras *x)
+{
+    uint32_t i;
+
+    for (i = 0; i < x->count; i++)
+    {
+        free(x->items[i].name);
+        free(x->items[i].map_Kd.path);
+        free(x->items[i].map_d.path);
+        free(x->items[i].refl.path);
+    }
+    free(x->items);
+}
+
+static const mtl_extra *
+mtl_extras_find(const mtl_extras *x, const char *name)
+{
+    uint32_t i;
+
+    if (name == NULL)
+        return NULL;
+    for (i = 0; i < x->count; i++)
+        if (x->items[i].name != NULL && strcmp(x->items[i].name, name) == 0)
+            return &x->items[i];
+    return NULL;
+}
+
+/* Read one MTL file for what fast_obj leaves out. A missing file is not an
+   error here: fast_obj has already reported on the materials it found. */
+static int
+read_mtl_file(const char *path, const char *base, mtl_extras *x)
+{
+    FILE *f = fopen(path, "rb");
+    char *line = NULL;
+    size_t cap = 0;
+    mtl_extra *cur = NULL;
+    int r;
+
+    if (f == NULL)
+        return 0;
+    while ((r = read_line(f, &line, &cap)) == 1)
+    {
+        const char *v;
+        char type[16];
+
+        if ((v = after_keyword(line, "newmtl")) != NULL)
+        {
+            if (x->count == x->capacity)
+            {
+                uint32_t c = x->capacity ? x->capacity * 2 : 16;
+                mtl_extra *grown = (mtl_extra *)realloc(x->items, (size_t)c * sizeof(mtl_extra));
+
+                if (grown == NULL)
+                {
+                    r = -1;
+                    break;
+                }
+                x->items = grown;
+                x->capacity = c;
+            }
+            cur = &x->items[x->count++];
+            memset(cur, 0, sizeof(*cur));
+            cur->name = rest_of_line("", v);
+        }
+        else if (cur == NULL)
+            continue;
+        else if (after_keyword(line, "Ka") != NULL)
+            cur->has_Ka = 1;
+        else if (after_keyword(line, "Ks") != NULL)
+            cur->has_Ks = 1;
+        else if (after_keyword(line, "Ke") != NULL)
+            cur->has_Ke = 1;
+        else if (after_keyword(line, "Ns") != NULL)
+            cur->has_Ns = 1;
+        else if ((v = after_keyword(line, "map_Kd")) != NULL)
+            parse_map(v, base, &cur->map_Kd, NULL, 0);
+        else if ((v = after_keyword(line, "map_d")) != NULL)
+            parse_map(v, base, &cur->map_d, NULL, 0);
+        else if ((v = after_keyword(line, "refl")) != NULL)
+        {
+            if (parse_map(v, base, &cur->refl, type, sizeof(type)) == 0 && strcmp(type, "sphere") != 0)
+            {
+                fprintf(stderr, "warning: material %s: only \"refl -type sphere\" is supported, "
+                        "reflection map left out\n", cur->name ? cur->name : "(unnamed)");
+                free(cur->refl.path);
+                cur->refl.path = NULL;
+            }
+        }
+    }
+    free(line);
+    fclose(f);
+    return r < 0 ? -1 : 0;
+}
+
+/* Find the OBJ's mtllib lines and read each library. Paths are taken from
+   the OBJ's directory, as fast_obj takes them. */
+static int
+read_mtl_extras(const char *obj_path, mtl_extras *x)
+{
+    const char *slash = strrchr(obj_path, '/');
+    const char *bslash = strrchr(obj_path, '\\');
+    char *base;
+    size_t nb;
+    FILE *f;
+    char *line = NULL;
+    size_t cap = 0;
+    int r, rc = 0;
+
+    if (bslash > slash)
+        slash = bslash;
+    nb = slash != NULL ? (size_t)(slash - obj_path + 1) : 0;
+    base = (char *)malloc(nb + 1);
+    if (base == NULL)
+        return -1;
+    memcpy(base, obj_path, nb);
+    base[nb] = '\0';
+
+    f = fopen(obj_path, "rb");
+    if (f == NULL)
+    {
+        free(base);
+        return 0;
+    }
+    while ((r = read_line(f, &line, &cap)) == 1)
+    {
+        const char *v = after_keyword(line, "mtllib");
+        char *lib;
+
+        if (v == NULL)
+            continue;
+        lib = rest_of_line(base, v);
+        if (lib != NULL)
+        {
+            if (read_mtl_file(lib, base, x) != 0)
+                rc = -1;
+            free(lib);
+        }
+    }
+    if (r < 0)
+        rc = -1;
+    free(line);
+    fclose(f);
+    free(base);
+    return rc;
+}
+
 /* Turn the collected corner indices into the arrays the writer takes, and
    work out which optional channels the submesh can carry. */
 static int
@@ -419,10 +835,9 @@ usage(const char *prog)
 {
     fprintf(stderr,
         "Usage: %s <input.obj> [output.prc] [output.pdf] [options]\n"
-        "  Writes the OBJ (and its MTL materials and PNG/JPEG diffuse maps) as PRC.\n"
+        "  Writes the OBJ (and its MTL materials and PNG/JPEG maps) as PRC.\n"
         "  --triangles     write uncompressed triangles for every part (default:\n"
-        "                  compressed, except textured parts, which are\n"
-        "                  written as triangles).\n"
+        "                  compressed)\n"
         "  --no-normals    ignore the file's vn normals (the reader computes them)\n"
         "  --no-materials  ignore the MTL file (no colours, no textures)\n"
         "  --quant-tolerance F\n"
@@ -443,6 +858,7 @@ main(int argc, char *argv[])
     double quant_tolerance = OBJ_IMPORT_QUANT_TOLERANCE;
 
     fastObjMesh *mesh = NULL;
+    mtl_extras extras = { NULL, 0, 0 };
     prc_context *ctx = NULL;
 
     submesh *subs = NULL;
@@ -523,6 +939,11 @@ main(int argc, char *argv[])
     if (mesh->face_count == 0 || mesh->position_count <= 1)
     {
         fprintf(stderr, "%s contains no faces\n", in_path);
+        goto done;
+    }
+    if (!ignore_materials && read_mtl_extras(in_path, &extras) != 0)
+    {
+        fprintf(stderr, "Out of memory\n");
         goto done;
     }
     printf("%s: %u positions, %u normals, %u texcoords, %u faces, %u materials, "
@@ -668,23 +1089,91 @@ main(int argc, char *argv[])
         submesh *s = &subs[i];
         const fastObjMaterial *m = (s->material != OBJ_NO_INDEX && !ignore_materials)
             ? &mesh->materials[s->material] : NULL;
+        const mtl_extra *mx = (m != NULL) ? mtl_extras_find(&extras, m->name) : NULL;
         int want_texture = 0;
+        uint32_t main_kind = PRC_API_WRITE_TEXTURE_KIND_DIFFUSE;
+        const map_line *placement = NULL;
+        double refl_intensity = 1.0;
         uint32_t has_normals, has_uvs, tw = 0, th = 0;
         prc_api_write_tessellation *t = &tess[i];
         prc_api_write_rep_item *ri = &items[i];
 
-        /* A texture is attached only if the image exists and is PNG or JPEG. */
-        if (m != NULL && m->map_Kd != 0 && mesh->textures[m->map_Kd].path != NULL)
+        /* The maps, in the order they are applied: diffuse, opacity,
+           reflection. The first image that loads is the item's texture and
+           the rest become layers after it. A map is attached only if its
+           image exists and is PNG or JPEG. */
+        if (m != NULL)
         {
-            const char *img = mesh->textures[m->map_Kd].path;
+            const map_line *maps[3];
+            const char *paths[3];
+            static const char *const names[3] = { "map_Kd", "map_d", "refl" };
+            static const uint32_t kinds[3] = { PRC_API_WRITE_TEXTURE_KIND_DIFFUSE,
+                PRC_API_WRITE_TEXTURE_KIND_OPACITY, PRC_API_WRITE_TEXTURE_KIND_SPHERICAL_REFLECTION };
+            uint32_t j;
 
-            if (read_file(img, &s->texture_bytes, &s->texture_size) != 0)
-                fprintf(stderr, "warning: texture %s not found, material left untextured\n", img);
-            else if (image_format(s->texture_bytes, s->texture_size, &s->texture_format, &tw, &th) != 0)
-                fprintf(stderr, "warning: texture %s is not PNG or JPEG, left untextured\n", img);
-            else
+            maps[0] = (mx != NULL && mx->map_Kd.path != NULL) ? &mx->map_Kd : NULL;
+            maps[1] = (mx != NULL && mx->map_d.path != NULL) ? &mx->map_d : NULL;
+            maps[2] = (mx != NULL && mx->refl.path != NULL) ? &mx->refl : NULL;
+            paths[0] = maps[0] ? maps[0]->path
+                : ((m->map_Kd != 0) ? mesh->textures[m->map_Kd].path : NULL);
+            paths[1] = maps[1] ? maps[1]->path
+                : ((m->map_d != 0) ? mesh->textures[m->map_d].path : NULL);
+            paths[2] = maps[2] ? maps[2]->path : NULL;
+
+            /* MTL scales a reflection map by Ks. With no Ks it applies in full. */
+            if (mx != NULL && mx->has_Ks)
+                refl_intensity = (m->Ks[0] + m->Ks[1] + m->Ks[2]) / 3.0;
+            if (paths[2] != NULL && !(refl_intensity > 0.0))
             {
-                want_texture = 1;
+                fprintf(stderr, "warning: material %s: Ks is black, so its reflection map "
+                        "has no effect; left out\n", m->name ? m->name : "(unnamed)");
+                paths[2] = NULL;
+            }
+
+            for (j = 0; j < 3; j++)
+            {
+                uint8_t *bytes = NULL;
+                size_t size = 0;
+                uint32_t fmt = 0, w = 0, h = 0;
+
+                if (paths[j] == NULL ||
+                    load_image(paths[j], names[j], &bytes, &size, &fmt, &w, &h) != 0)
+                    continue;
+                if (!want_texture)
+                {
+                    want_texture = 1;
+                    main_kind = kinds[j];
+                    placement = maps[j];
+                    s->texture_bytes = bytes;
+                    s->texture_size = size;
+                    s->texture_format = fmt;
+                    tw = w;
+                    th = h;
+                }
+                else
+                {
+                    prc_api_write_texture_layer *L = &s->layers[s->num_layers];
+
+                    /* A layer uses the main texture's placement and wrap. */
+                    if (maps[j] != NULL && maps[j]->placed &&
+                        (placement == NULL ||
+                         maps[j]->scale[0] != placement->scale[0] || maps[j]->scale[1] != placement->scale[1] ||
+                         maps[j]->offset[0] != placement->offset[0] || maps[j]->offset[1] != placement->offset[1] ||
+                         maps[j]->clamp != placement->clamp))
+                        fprintf(stderr, "warning: material %s: %s has its own -s/-o/-clamp; "
+                                "it is placed as the first map instead\n",
+                                m->name ? m->name : "(unnamed)", names[j]);
+                    s->layer_bytes[s->num_layers] = bytes;
+                    L->kind = kinds[j];
+                    L->image = bytes;
+                    L->image_size = size;
+                    L->format = fmt;
+                    L->width = w;
+                    L->height = h;
+                    L->intensity = (kinds[j] == PRC_API_WRITE_TEXTURE_KIND_SPHERICAL_REFLECTION)
+                        ? refl_intensity : 1.0;
+                    s->num_layers++;
+                }
             }
         }
 
@@ -703,7 +1192,7 @@ main(int argc, char *argv[])
         if (ignore_normals)
             has_normals = 0;
 
-        t->kind = (force_triangles || want_texture)
+        t->kind = force_triangles
             ? PRC_API_WRITE_TESS_KIND_TRIANGLES : PRC_API_WRITE_TESS_KIND_COMPRESSED;
         t->positions = s->positions;
         t->num_positions = s->num_positions;
@@ -744,6 +1233,32 @@ main(int argc, char *argv[])
             ri->material_alpha = (m->d > 0.0f && m->d <= 1.0f) ? m->d : 1.0;
             /* MTL Ns runs 0..1000; the writer takes 0..1. */
             ri->material_shininess = m->Ns <= 0.0f ? 0.0 : (m->Ns >= 1000.0f ? 1.0 : m->Ns / 1000.0);
+            /* fast_obj gives a material without Ns the value 1, which would be
+               written as 0.001, a highlight spread over the whole surface.
+               Without Ns, leave it to the writer's default instead. */
+            if (mx != NULL && !mx->has_Ns)
+                ri->material_shininess = 0.0;
+
+            /* Ambient, specular and emissive, but only if the MTL gives at
+               least one of them; a slot it leaves out keeps the writer's
+               default, as when none is given. */
+            if (mx != NULL && (mx->has_Ka || mx->has_Ks || mx->has_Ke))
+            {
+                uint32_t c;
+
+                ri->has_material_slots = 1;
+                for (c = 0; c < 3; c++)
+                {
+                    ri->material_ambient[c] = mx->has_Ka ? m->Ka[c] : m->Kd[c];
+                    ri->material_specular[c] = mx->has_Ks ? m->Ks[c] : 0.2;
+                    ri->material_emissive[c] = mx->has_Ke ? m->Ke[c] : 0.0;
+                }
+                /* With slots the shininess is written exactly as given, so
+                   an absent Ns takes the 0.3 the writer uses otherwise. */
+                if (!mx->has_Ns)
+                    ri->material_shininess = 0.3;
+            }
+
             if (want_texture)
             {
                 ri->has_texture = 1;
@@ -752,6 +1267,28 @@ main(int argc, char *argv[])
                 ri->texture_format = s->texture_format;
                 ri->texture_width = tw;
                 ri->texture_height = th;
+                ri->texture_kind = main_kind;
+                if (main_kind == PRC_API_WRITE_TEXTURE_KIND_SPHERICAL_REFLECTION)
+                    ri->texture_intensity = refl_intensity;
+                if (placement != NULL)
+                {
+                    ri->texture_scale[0] = placement->scale[0];
+                    ri->texture_scale[1] = placement->scale[1];
+                    ri->texture_offset[0] = placement->offset[0];
+                    ri->texture_offset[1] = placement->offset[1];
+                    if (placement->clamp)
+                    {
+                        /* MTL's clamp keeps the image to 0..1; the nearest
+                           wrap PRC readers show is clamp to border. */
+                        ri->texture_wrap_u = PRC_API_WRITE_TEXTURE_WRAP_CLAMP_TO_BORDER;
+                        ri->texture_wrap_v = PRC_API_WRITE_TEXTURE_WRAP_CLAMP_TO_BORDER;
+                    }
+                }
+                if (s->num_layers > 0)
+                {
+                    ri->texture_layers = s->layers;
+                    ri->num_texture_layers = s->num_layers;
+                }
             }
         }
         total_tris += s->face_tri_count;
@@ -829,18 +1366,19 @@ main(int argc, char *argv[])
     }
 
     {
-        uint32_t textured = 0, compressed = 0;
+        uint32_t textured = 0, compressed = 0, layers = 0;
 
         for (i = 0; i < num_subs; i++)
         {
             if (items[i].has_texture) textured++;
+            layers += items[i].num_texture_layers;
             if (tess[i].kind == PRC_API_WRITE_TESS_KIND_COMPRESSED) compressed++;
         }
         printf("Wrote %s (%lu bytes) and %s: %u parts, %u tessellations "
-               "(%u compressed, %u textured), %u triangles; %u polygons triangulated, "
-               "%u degenerate faces skipped\n",
+               "(%u compressed, %u textured, %u texture layers), %u triangles; "
+               "%u polygons triangulated, %u degenerate faces skipped\n",
                prc_path, (unsigned long)prc_size, pdf_path, root.num_children, num_subs,
-               compressed, textured, total_tris, polygons_split, degenerate_skipped);
+               compressed, textured, layers, total_tris, polygons_split, degenerate_skipped);
     }
     rc = 0;
 
@@ -858,6 +1396,7 @@ done:
     free(tess); free(items); free(nodes); free(children);
     free(corner); free(proj); free(ring); free(tri.data);
     free(prc_default); free(pdf_default);
+    mtl_extras_free(&extras);
     if (mesh != NULL)
         fast_obj_destroy(mesh);
     return rc;
