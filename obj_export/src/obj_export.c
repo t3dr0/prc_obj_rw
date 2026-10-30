@@ -39,6 +39,8 @@ and linking extracted texture maps via the standard map_Kd syntax.
 
 - Full Vertex Attributes Export: Formats and writes absolute geometric coordinates, including spatial positions (v),
 explicit surface normal vectors (vn), and normalized texture mapping coordinates (vt).
+Vertex colours, where a tessellation's vary, are written after the position as
+"v x y z r g b", the extension MeshLab, Blender and others read.
 
 - Multi-Topology Primitive Triangulation: Decodes and unwinds complex GPU primitives - including independent triangle listings,
 high-density triangle strips, and triangle fans - translating them into uniform 3-element face records (f).
@@ -308,12 +310,25 @@ static int transform_mirrors(const prc_api_transform *xform)
 }
 
 /**
+ * @brief The colour a vertex is drawn with, apart from the material's diffuse
+ * colour, as nanoPRC's viewer demo shades it. Where the face styles each
+ * vertex (prc_api_vertices_have_material) that is the vertex's own diffuse
+ * colour, and the face's material is not used; otherwise it is the vertex
+ * colour, which the material's diffuse colour then multiplies, so the MTL
+ * keeps that as Kd.
+ */
+static const float *vertex_color(const prc_api_vertex *v, int per_vertex_material)
+{
+    return per_vertex_material ? v->diffuse : v->color;
+}
+
+/**
  * @brief Formats and writes a single triangle face record into the Wavefront OBJ standard stream,
  * utilizing independent global counters to prevent cross-attribute index drift. The triangle is
  * moved into place by xform; mirror swaps its last two corners (see transform_mirrors).
  */
 static void process_and_write_obj_triangle(FILE* obj_out, prc_api_vertex v1, prc_api_vertex v2, prc_api_vertex v3,
-    const prc_api_transform *xform, int mirror,
+    const prc_api_transform *xform, int mirror, int with_color, int per_vertex_material,
     uint32_t* v_count, uint32_t* vt_count, uint32_t* vn_count)
 {
     if (mirror)
@@ -352,10 +367,26 @@ static void process_and_write_obj_triangle(FILE* obj_out, prc_api_vertex v1, prc
     uint32_t vt_idx = *vt_count;
     uint32_t vn_idx = *vn_count;
 
-    /* 1. Write vertex spatial coordinates */
-    fprintf(obj_out, "v %f %f %f\n", v1.position[0], v1.position[1], v1.position[2]);
-    fprintf(obj_out, "v %f %f %f\n", v2.position[0], v2.position[1], v2.position[2]);
-    fprintf(obj_out, "v %f %f %f\n", v3.position[0], v3.position[1], v3.position[2]);
+    /* 1. Write vertex spatial coordinates, and the colour after them when the
+     *    tessellation's colours vary (see tess_colors_vary and vertex_color). */
+    {
+        const prc_api_vertex *vs[3] = { &v1, &v2, &v3 };
+        for (int c = 0; c < 3; c++)
+        {
+            if (with_color)
+            {
+                const float *rgb = vertex_color(vs[c], per_vertex_material);
+
+                fprintf(obj_out, "v %f %f %f %f %f %f\n",
+                    vs[c]->position[0], vs[c]->position[1], vs[c]->position[2],
+                    rgb[0], rgb[1], rgb[2]);
+            }
+            else
+            {
+                fprintf(obj_out, "v %f %f %f\n", vs[c]->position[0], vs[c]->position[1], vs[c]->position[2]);
+            }
+        }
+    }
     *v_count += 3;
 
     /* 2. Write texture coordinates only if explicitly available. nanoPRC's reader
@@ -419,6 +450,45 @@ static void process_and_write_obj_triangle(FILE* obj_out, prc_api_vertex v1, prc
 }
 
 /**
+ * @brief 1 if the vertices of a surface tessellation are not all drawn with
+ * the same colour (see vertex_color). The reader gives every vertex a colour
+ * even when the file stores none, so a uniform colour adds nothing the
+ * material does not already say, and only varying colours are written.
+ */
+static int tess_colors_vary(prc_context *ctx, const prc_api_tess *tess)
+{
+    const float *first = NULL;
+    uint32_t nbufs = (tess->type == PRC_API_TESS_3D_Compressed) ? 1 : tess->num_faces;
+
+    for (uint32_t b = 0; b < nbufs; b++)
+    {
+        const prc_api_tess_vertex_buffer *buf = (tess->type == PRC_API_TESS_3D_Compressed)
+            ? &tess->tess_vertices : &tess->tess_faces[b].face_vertices;
+        int per_vertex_material;
+
+        if (!buf->vertices)
+        {
+            continue;
+        }
+        per_vertex_material = prc_api_vertices_have_material(ctx, tess, b) ? 1 : 0;
+        for (uint32_t k = 0; k < buf->num_vertices; k++)
+        {
+            const float *c = vertex_color(&buf->vertices[k], per_vertex_material);
+
+            if (!first)
+            {
+                first = c;
+            }
+            else if (c[0] != first[0] || c[1] != first[1] || c[2] != first[2])
+            {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/**
  * @brief Resolves base paths and filenames to safely manage platform-agnostic file writing.
  */
 static void extract_stem_properties(const char *obj_path, char *out_stem_path, char *out_stem_filename, size_t max_len)
@@ -472,6 +542,8 @@ int main(int argc, char *argv[])
     instance_list instances = { NULL, 0, 0 };
     uint8_t *tess_drawn = NULL;
     uint8_t *materials_written = NULL;
+    uint8_t *tess_colored = NULL;   /* 1 where tess_colors_vary */
+    uint32_t colored_count = 0;
 
     /* Deduplication Tracking Registry */
     TrackedTexture *tracked_textures = NULL;
@@ -566,7 +638,8 @@ int main(int argc, char *argv[])
     {
         tess_drawn = calloc(total_tessellations, 1);
         materials_written = calloc(total_tessellations, 1);
-        if (!tess_drawn || !materials_written)
+        tess_colored = calloc(total_tessellations, 1);
+        if (!tess_drawn || !materials_written || !tess_colored)
         {
             fprintf(stderr, "Error: out of memory\n");
             ret = 1;
@@ -593,6 +666,13 @@ int main(int argc, char *argv[])
             (tesses[i].type == PRC_API_TESS_3D || tesses[i].type == PRC_API_TESS_3D_Compressed))
         {
             fprintf(stderr, "Warning: tessellation %u is not drawn by any part; not exported.\n", i);
+        }
+        if (tess_drawn[i] &&
+            (tesses[i].type == PRC_API_TESS_3D || tesses[i].type == PRC_API_TESS_3D_Compressed) &&
+            tess_colors_vary(ctx, &tesses[i]))
+        {
+            tess_colored[i] = 1;
+            colored_count++;
         }
     }
 
@@ -624,6 +704,7 @@ int main(int argc, char *argv[])
         const prc_api_transform *xform = &instances.items[n].xform;
         int mirror = transform_mirrors(xform);
         int write_materials = !materials_written[i];
+        int with_color = tess_colored[i];
         prc_api_tess *tess = &tesses[i];
         if (tess->type != PRC_API_TESS_3D && tess->type != PRC_API_TESS_3D_Compressed)
         {
@@ -660,6 +741,7 @@ int main(int argc, char *argv[])
                 continue;
             }
 
+            int per_vertex_material = prc_api_vertices_have_material(ctx, tess, (uint32_t)f) ? 1 : 0;
             char dynamic_mat_id[128];
             char texture_local_name[256] = {0};
             snprintf(dynamic_mat_id, sizeof(dynamic_mat_id), "mat_tess_%u_face_%zu", i, f);
@@ -741,10 +823,20 @@ int main(int argc, char *argv[])
                 }
             }
 
-            /* Resolve material records */
+            /* Resolve material records. Where each vertex carries its own
+               material, its diffuse colour is written as the vertex colour,
+               so Kd is white: an importer multiplies the two, as the reader
+               multiplies a vertex colour by the material's. */
             if (!write_materials)
             {
                 /* Written with this tessellation's first instance. */
+            }
+            else if (with_color && per_vertex_material)
+            {
+                prc_api_material white = face->is_material ? face->material
+                    : tess->is_material ? tess->tess_material : (prc_api_material){ .diffuse_alpha = 1.0f };
+                white.diffuse[0] = white.diffuse[1] = white.diffuse[2] = 1.0f;
+                write_mtl_material(mtl_file, dynamic_mat_id, &white, texture_local_name);
             }
             else if (face->is_material)
             {
@@ -793,7 +885,7 @@ int main(int argc, char *argv[])
                                 vertex_buf->vertices[i0],
                                 vertex_buf->vertices[i1],
                                 vertex_buf->vertices[i2],
-                                xform, mirror,
+                                xform, mirror, with_color, per_vertex_material,
                                 &global_v_counter,
                                 &global_vt_counter,
                                 &global_vn_counter);
@@ -825,7 +917,7 @@ int main(int argc, char *argv[])
                                 vertex_buf->vertices[i0],
                                 vertex_buf->vertices[i1],
                                 vertex_buf->vertices[i2],
-                                xform, mirror,
+                                xform, mirror, with_color, per_vertex_material,
                                 &global_v_counter,
                                 &global_vt_counter,
                                 &global_vn_counter);
@@ -847,7 +939,7 @@ int main(int argc, char *argv[])
                                 vertex_buf->vertices[i0],
                                 vertex_buf->vertices[i1],
                                 vertex_buf->vertices[i2],
-                                xform, mirror,
+                                xform, mirror, with_color, per_vertex_material,
                                 &global_v_counter,
                                 &global_vt_counter,
                                 &global_vn_counter);
@@ -858,8 +950,9 @@ int main(int argc, char *argv[])
         }
     }
 
-    printf("OBJ export completed successfully. Unique textures written: %zu. Total vertices: %u\n",
-           tracked_count, global_v_counter - 1);
+    printf("OBJ export completed successfully. Unique textures written: %zu. Total vertices: %u. "
+           "Tessellations with vertex colours: %u\n",
+           tracked_count, global_v_counter - 1, colored_count);
 
 cleanup:
     if (tracked_textures)
@@ -869,6 +962,7 @@ cleanup:
     free(instances.items);
     free(tess_drawn);
     free(materials_written);
+    free(tess_colored);
     if (obj_file)
     {
         fclose(obj_file);

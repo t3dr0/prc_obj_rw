@@ -34,6 +34,11 @@
  *     map_d image becomes an opacity layer and a "refl -type sphere" image a
  *     reflection layer after it, or the item's only texture when there is
  *     no map_Kd.
+ *   - vertex colours given as "v x y z r g b", the extension MeshLab,
+ *     Blender and obj_export write, become the tessellation's vertex
+ *     colours, one per triangle corner. Readers apply the material's Kd on
+ *     top of them, as the original PRC did. A part whose vertices are all
+ *     white, as fast_obj fills in where a file gives no colour, gets none.
  *
  * fast_obj v1.3 ignores a map line that has options and never reads refl,
  * so the MTL files are read a second time here for those (read_mtl_extras).
@@ -44,7 +49,7 @@
  * Usage:
  *     nano_prc_obj_import <input.obj> [output.prc] [output.pdf]
  *                         [--triangles] [--no-normals] [--no-materials]
- *                         [--quant-tolerance F]
+ *                         [--no-colors] [--quant-tolerance F]
  *
  * Output paths default to the input's name with .obj replaced.
  *
@@ -239,6 +244,7 @@ typedef struct
     uint32_t *tri_indices;
     uint32_t *norm_indices;
     uint32_t *tex_indices;
+    uint8_t  *colors;           /* r,g,b per triangle corner, or NULL */
     uint32_t  face_tri_count;
     double    bbox_min[3], bbox_max[3];
     uint8_t  *texture_bytes;
@@ -257,6 +263,7 @@ submesh_free(submesh *s)
     free(s->p.data); free(s->t.data); free(s->n.data);
     free(s->positions); free(s->normals); free(s->tex_coords);
     free(s->tri_indices); free(s->norm_indices); free(s->tex_indices);
+    free(s->colors);
     free(s->texture_bytes);
     free(s->layer_bytes[0]); free(s->layer_bytes[1]);
 }
@@ -754,11 +761,57 @@ read_mtl_extras(const char *obj_path, mtl_extras *x)
     return rc;
 }
 
+static uint8_t
+color_byte(float c)
+{
+    if (!(c > 0.0f))
+        return 0;
+    if (c >= 1.0f)
+        return 255;
+    return (uint8_t)(c * 255.0f + 0.5f);
+}
+
+/* One colour per triangle corner, from the corner's position, as the writer
+   takes them. Left NULL when every corner is white: fast_obj gives white to
+   every position the file does not colour, so that is no colour at all. */
+static int
+build_corner_colors(const fastObjMesh *mesh, submesh *s)
+{
+    uint8_t *c;
+    uint32_t i;
+    int any = 0;
+
+    if (mesh->color_count == 0 || mesh->colors == NULL || s->p.count == 0)
+        return 0;
+    c = (uint8_t *)malloc((size_t)s->p.count * 3);
+    if (c == NULL)
+        return -1;
+    for (i = 0; i < s->p.count; i++)
+    {
+        const float *src = &mesh->colors[s->p.data[i] * 3];
+        uint32_t d;
+
+        for (d = 0; d < 3; d++)
+        {
+            c[i * 3 + d] = color_byte(src[d]);
+            if (c[i * 3 + d] != 255)
+                any = 1;
+        }
+    }
+    if (!any)
+    {
+        free(c);
+        return 0;
+    }
+    s->colors = c;
+    return 0;
+}
+
 /* Turn the collected corner indices into the arrays the writer takes, and
    work out which optional channels the submesh can carry. */
 static int
 build_submesh(const fastObjMesh *mesh, submesh *s, int want_texture,
-    uint32_t *has_normals, uint32_t *has_uvs)
+    int want_colors, uint32_t *has_normals, uint32_t *has_uvs)
 {
     uint32_t i, d;
 
@@ -782,6 +835,8 @@ build_submesh(const fastObjMesh *mesh, submesh *s, int want_texture,
     if (*has_uvs &&
         compact_stream(&s->t, mesh->texcoords, mesh->texcoord_count, 2,
                        &s->tex_coords, &s->num_tex_coords, &s->tex_indices) != 0)
+        return -1;
+    if (want_colors && build_corner_colors(mesh, s) != 0)
         return -1;
 
     s->face_tri_count = s->p.count / 3;
@@ -840,6 +895,7 @@ usage(const char *prog)
         "                  compressed)\n"
         "  --no-normals    ignore the file's vn normals (the reader computes them)\n"
         "  --no-materials  ignore the MTL file (no colours, no textures)\n"
+        "  --no-colors     ignore vertex colours given as v x y z r g b\n"
         "  --quant-tolerance F\n"
         "                  compressed tessellations' quantization tolerance, as a\n"
         "                  fraction of the bounding-box diagonal (default %g)\n",
@@ -853,7 +909,7 @@ main(int argc, char *argv[])
     const char *prc_path = NULL;
     const char *pdf_path = NULL;
     char *prc_default = NULL, *pdf_default = NULL;
-    int force_triangles = 0, ignore_normals = 0, ignore_materials = 0;
+    int force_triangles = 0, ignore_normals = 0, ignore_materials = 0, ignore_colors = 0;
     int a, rc = 1;
     double quant_tolerance = OBJ_IMPORT_QUANT_TOLERANCE;
 
@@ -892,6 +948,8 @@ main(int argc, char *argv[])
             ignore_normals = 1;
         else if (strcmp(argv[a], "--no-materials") == 0)
             ignore_materials = 1;
+        else if (strcmp(argv[a], "--no-colors") == 0)
+            ignore_colors = 1;
         else if (strcmp(argv[a], "--quant-tolerance") == 0 && a + 1 < argc)
         {
             quant_tolerance = atof(argv[++a]);
@@ -1177,7 +1235,7 @@ main(int argc, char *argv[])
             }
         }
 
-        if (build_submesh(mesh, s, want_texture, &has_normals, &has_uvs) != 0)
+        if (build_submesh(mesh, s, want_texture, !ignore_colors, &has_normals, &has_uvs) != 0)
         {
             fprintf(stderr, "Out of memory\n");
             goto done;
@@ -1220,6 +1278,11 @@ main(int argc, char *argv[])
             t->tex_coords = s->tex_coords;
             t->num_tex_coords = s->num_tex_coords;
             t->tex_indices = s->tex_indices;
+        }
+        if (s->colors != NULL)
+        {
+            t->vertex_colors = s->colors;
+            t->num_vertex_colors = s->p.count;
         }
 
         ri->kind = PRC_API_WRITE_RI_SURFACE;
@@ -1379,19 +1442,20 @@ main(int argc, char *argv[])
     }
 
     {
-        uint32_t textured = 0, compressed = 0, layers = 0;
+        uint32_t textured = 0, compressed = 0, layers = 0, colored = 0;
 
         for (i = 0; i < num_subs; i++)
         {
             if (items[i].has_texture) textured++;
+            if (tess[i].vertex_colors != NULL) colored++;
             layers += items[i].num_texture_layers;
             if (tess[i].kind == PRC_API_WRITE_TESS_KIND_COMPRESSED) compressed++;
         }
         printf("Wrote %s (%lu bytes) and %s: %u parts, %u tessellations "
-               "(%u compressed, %u textured, %u texture layers), %u triangles; "
-               "%u polygons triangulated, %u degenerate faces skipped\n",
+               "(%u compressed, %u textured, %u texture layers, %u with vertex colours), "
+               "%u triangles; %u polygons triangulated, %u degenerate faces skipped\n",
                prc_path, (unsigned long)prc_size, pdf_path, root.num_children, num_subs,
-               compressed, textured, layers, total_tris, polygons_split, degenerate_skipped);
+               compressed, textured, layers, colored, total_tris, polygons_split, degenerate_skipped);
     }
     rc = 0;
 
