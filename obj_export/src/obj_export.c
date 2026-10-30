@@ -141,13 +141,210 @@ static void write_mtl_material(FILE *mtl_out, const char *mat_name, const prc_ap
     fprintf(mtl_out, "\n");
 }
 
+/* -------------------------------------------------------------------- */
+/* Where each tessellation is drawn                                      */
+/* -------------------------------------------------------------------- */
+
+/* One place a tessellation is drawn: its index and the transform from the
+   root of the model tree down to the part that draws it. Geometry is often
+   stored around its own origin and placed by these transforms; written
+   without them, the parts of an assembly pile up at the origin. */
+typedef struct
+{
+    uint32_t tess;
+    prc_api_transform xform;
+} tess_instance;
+
+typedef struct
+{
+    tess_instance *items;
+    size_t count, cap;
+} instance_list;
+
+static int add_instance(instance_list *l, uint32_t tess, const prc_api_transform *xform)
+{
+    if (l->count == l->cap)
+    {
+        size_t cap = l->cap ? l->cap * 2 : 64;
+        tess_instance *g = realloc(l->items, cap * sizeof(*g));
+
+        if (!g)
+        {
+            return -1;
+        }
+        l->items = g;
+        l->cap = cap;
+    }
+    l->items[l->count].tess = tess;
+    l->items[l->count].xform = *xform;
+    l->count++;
+    return 0;
+}
+
+/**
+ * @brief Walks the model tree as demos/stl_export in nanoPRC does, composing
+ * each product's own placement (prc_api_product::location) after its
+ * parents' with prc_api_update_transform, and lists every tessellation each
+ * part draws with that transform.
+ *
+ * A part's geometry is on the part itself or on its representation items,
+ * which can nest in sets to a depth the file chooses, so those are visited
+ * from an explicit stack. Tessellations are looked up by part_detail_index,
+ * the API's numbering, which differs from the file's wherever parts share a
+ * file tessellation.
+ */
+static int collect_instances(prc_context *ctx, const prc_api_product *node, prc_api_transform parent,
+    uint32_t total_tessellations, instance_list *out, uint8_t *tess_drawn)
+{
+    prc_api_transform world = parent;
+    size_t k;
+
+    prc_api_update_transform(ctx, &world, (prc_api_transform *)&node->location);
+
+    if (node->part)
+    {
+        const prc_api_part **stack;
+        size_t depth = 0, capacity = 16;
+
+        stack = malloc(capacity * sizeof(*stack));
+        if (!stack)
+        {
+            return -1;
+        }
+        stack[depth++] = node->part;
+        while (depth > 0)
+        {
+            const prc_api_part *item = stack[--depth];
+            size_t ri;
+
+            if (item->biased_tess_index > 0 && item->part_detail_index < total_tessellations)
+            {
+                if (add_instance(out, item->part_detail_index, &world) != 0)
+                {
+                    free((void *)stack);
+                    return -1;
+                }
+                tess_drawn[item->part_detail_index] = 1;
+            }
+            for (ri = item->num_rep_items; ri > 0; ri--)
+            {
+                if (depth == capacity)
+                {
+                    const prc_api_part **grown = realloc((void *)stack, capacity * 2 * sizeof(*stack));
+
+                    if (!grown)
+                    {
+                        free((void *)stack);
+                        return -1;
+                    }
+                    stack = grown;
+                    capacity *= 2;
+                }
+                stack[depth++] = &item->rep_items[ri - 1];
+            }
+        }
+        free((void *)stack);
+    }
+
+    for (k = 0; k < node->num_children; k++)
+    {
+        if (collect_instances(ctx, &node->children[k], world, total_tessellations, out, tess_drawn) != 0)
+        {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/**
+ * @brief Applies a transform's linear (3x3) part to a normal and renormalises.
+ * Exact for rotations, mirrors and uniform scale; under non-uniform scale or
+ * shear a normal strictly needs the inverse transpose, which is not attempted
+ * (as in nanoPRC's demos/stl_export). Positions are always exact.
+ */
+static void transform_normal(const prc_api_transform *xform, const float in[3], float out[3])
+{
+    const double *m;
+    float len;
+
+    if (xform->is_identity)
+    {
+        out[0] = in[0]; out[1] = in[1]; out[2] = in[2];
+        return;
+    }
+    m = xform->matrix;
+    out[0] = (float)(m[0] * in[0] + m[4] * in[1] + m[8]  * in[2]);
+    out[1] = (float)(m[1] * in[0] + m[5] * in[1] + m[9]  * in[2]);
+    out[2] = (float)(m[2] * in[0] + m[6] * in[1] + m[10] * in[2]);
+    len = sqrtf(out[0] * out[0] + out[1] * out[1] + out[2] * out[2]);
+    if (len > 1e-7f)
+    {
+        out[0] /= len; out[1] /= len; out[2] /= len;
+    }
+    else
+    {
+        out[0] = in[0]; out[1] = in[1]; out[2] = in[2];
+    }
+}
+
+/**
+ * @brief 1 if the transform mirrors (its linear part has a negative
+ * determinant). A mirrored triangle's corners then run the other way round,
+ * so they are swapped back to keep the face pointing outward.
+ */
+static int transform_mirrors(const prc_api_transform *xform)
+{
+    const double *m = xform->matrix;
+    double det;
+
+    if (xform->is_identity)
+    {
+        return 0;
+    }
+    det = m[0] * (m[5] * m[10] - m[9] * m[6])
+        - m[4] * (m[1] * m[10] - m[9] * m[2])
+        + m[8] * (m[1] * m[6] - m[5] * m[2]);
+    return det < 0.0;
+}
+
 /**
  * @brief Formats and writes a single triangle face record into the Wavefront OBJ standard stream,
- * utilizing independent global counters to prevent cross-attribute index drift.
+ * utilizing independent global counters to prevent cross-attribute index drift. The triangle is
+ * moved into place by xform; mirror swaps its last two corners (see transform_mirrors).
  */
 static void process_and_write_obj_triangle(FILE* obj_out, prc_api_vertex v1, prc_api_vertex v2, prc_api_vertex v3,
+    const prc_api_transform *xform, int mirror,
     uint32_t* v_count, uint32_t* vt_count, uint32_t* vn_count)
 {
+    if (mirror)
+    {
+        prc_api_vertex t = v2;
+        v2 = v3;
+        v3 = t;
+    }
+
+    /* Into place: positions and normals both, so the normals computed below
+       for corners without one are already in place too. */
+    {
+        prc_api_vertex *vs[3] = { &v1, &v2, &v3 };
+        for (int c = 0; c < 3; c++)
+        {
+            double in[3] = { vs[c]->position[0], vs[c]->position[1], vs[c]->position[2] };
+            double p[3];
+            float n[3];
+
+            prc_api_transform_point(xform, in, p);
+            vs[c]->position[0] = (float)p[0];
+            vs[c]->position[1] = (float)p[1];
+            vs[c]->position[2] = (float)p[2];
+            if (vs[c]->normal_set)
+            {
+                transform_normal(xform, vs[c]->normal, n);
+                memcpy(vs[c]->normal, n, sizeof(n));
+            }
+        }
+    }
+
     uint8_t has_uv = (v1.uv_set && v2.uv_set && v3.uv_set);
 
     /* Capture current 1-based start offsets for this specific triangle */
@@ -269,6 +466,13 @@ int main(int argc, char *argv[])
     FILE *mtl_file = NULL;
     int ret = 0;
 
+    /* Where each tessellation is drawn, and which have had their materials
+       written: a tessellation drawn by several parts is written at each
+       place, but its materials and textures once. */
+    instance_list instances = { NULL, 0, 0 };
+    uint8_t *tess_drawn = NULL;
+    uint8_t *materials_written = NULL;
+
     /* Deduplication Tracking Registry */
     TrackedTexture *tracked_textures = NULL;
     size_t tracked_count = 0;
@@ -358,6 +562,40 @@ int main(int argc, char *argv[])
         }
     }
 
+    if (total_tessellations > 0)
+    {
+        tess_drawn = calloc(total_tessellations, 1);
+        materials_written = calloc(total_tessellations, 1);
+        if (!tess_drawn || !materials_written)
+        {
+            fprintf(stderr, "Error: out of memory\n");
+            ret = 1;
+            goto cleanup;
+        }
+    }
+    if (model_tree)
+    {
+        prc_api_transform root_transform;
+        prc_api_set_transform_identity(ctx, &root_transform);
+        if (collect_instances(ctx, model_tree, root_transform, total_tessellations, &instances, tess_drawn) != 0)
+        {
+            fprintf(stderr, "Error: out of memory\n");
+            ret = 1;
+            goto cleanup;
+        }
+    }
+
+    /* A surface tessellation that no part draws is reported, not written.
+       Adobe Acrobat does not draw one either. */
+    for (uint32_t i = 0; i < total_tessellations; i++)
+    {
+        if (!tess_drawn[i] &&
+            (tesses[i].type == PRC_API_TESS_3D || tesses[i].type == PRC_API_TESS_3D_Compressed))
+        {
+            fprintf(stderr, "Warning: tessellation %u is not drawn by any part; not exported.\n", i);
+        }
+    }
+
     obj_file = fopen(output_path, "w");
     if (!obj_file)
     {
@@ -380,13 +618,18 @@ int main(int argc, char *argv[])
     fprintf(mtl_file, "# Generated by prc_obj_rw obj_export (c) Ian Curington, Thames 3D Research,\n"
                       "# using the nanoPRC PRC library (c) CascadiaVoxel LLC. Both AGPLv3.\n\n");
 
-    for (uint32_t i = 0; i < total_tessellations; i++)
+    for (size_t n = 0; n < instances.count; n++)
     {
+        uint32_t i = instances.items[n].tess;
+        const prc_api_transform *xform = &instances.items[n].xform;
+        int mirror = transform_mirrors(xform);
+        int write_materials = !materials_written[i];
         prc_api_tess *tess = &tesses[i];
         if (tess->type != PRC_API_TESS_3D && tess->type != PRC_API_TESS_3D_Compressed)
         {
             continue;
         }
+        materials_written[i] = 1;
 
         const char *part_boundary_name = (tess->name && strlen(tess->name) > 0) ? tess->name : "Unnamed_PRC_Component_Part";
         fprintf(obj_file, "\n# Part: %s\n", part_boundary_name);
@@ -421,8 +664,10 @@ int main(int argc, char *argv[])
             char texture_local_name[256] = {0};
             snprintf(dynamic_mat_id, sizeof(dynamic_mat_id), "mat_tess_%u_face_%zu", i, f);
 
-            /* Texture Optimization: Deduplicate embedded raster streams */
-            if (face->is_texture && face->texture.data && face->texture.width > 0 && face->texture.height > 0)
+            /* Texture Optimization: Deduplicate embedded raster streams. Only the
+               first place a tessellation is drawn writes its materials; later
+               places reuse them by name. */
+            if (write_materials && face->is_texture && face->texture.data && face->texture.width > 0 && face->texture.height > 0)
             {
                 int found_duplicate = 0;
                 size_t current_texture_bytes = (size_t)face->texture.width * face->texture.height * face->texture.num_channels;
@@ -497,7 +742,11 @@ int main(int argc, char *argv[])
             }
 
             /* Resolve material records */
-            if (face->is_material)
+            if (!write_materials)
+            {
+                /* Written with this tessellation's first instance. */
+            }
+            else if (face->is_material)
             {
                 write_mtl_material(mtl_file, dynamic_mat_id, &face->material, texture_local_name);
             }
@@ -544,6 +793,7 @@ int main(int argc, char *argv[])
                                 vertex_buf->vertices[i0],
                                 vertex_buf->vertices[i1],
                                 vertex_buf->vertices[i2],
+                                xform, mirror,
                                 &global_v_counter,
                                 &global_vt_counter,
                                 &global_vn_counter);
@@ -575,6 +825,7 @@ int main(int argc, char *argv[])
                                 vertex_buf->vertices[i0],
                                 vertex_buf->vertices[i1],
                                 vertex_buf->vertices[i2],
+                                xform, mirror,
                                 &global_v_counter,
                                 &global_vt_counter,
                                 &global_vn_counter);
@@ -596,6 +847,7 @@ int main(int argc, char *argv[])
                                 vertex_buf->vertices[i0],
                                 vertex_buf->vertices[i1],
                                 vertex_buf->vertices[i2],
+                                xform, mirror,
                                 &global_v_counter,
                                 &global_vt_counter,
                                 &global_vn_counter);
@@ -614,6 +866,9 @@ cleanup:
     {
         free(tracked_textures);
     }
+    free(instances.items);
+    free(tess_drawn);
+    free(materials_written);
     if (obj_file)
     {
         fclose(obj_file);
