@@ -39,8 +39,10 @@ and linking extracted texture maps via the standard map_Kd syntax.
 
 - Full Vertex Attributes Export: Formats and writes absolute geometric coordinates, including spatial positions (v),
 explicit surface normal vectors (vn), and normalized texture mapping coordinates (vt).
-Vertex colours, where a tessellation's vary, are written after the position as
-"v x y z r g b", the extension MeshLab, Blender and others read.
+Each face's colour is written as nanoPRC's reader draws it (see face_shading): as the
+material's Kd where it is the same across the face, otherwise after each position as
+"v x y z r g b", the extension MeshLab, Blender and others read, which an importer then
+multiplies by Kd as the reader does.
 
 - Multi-Topology Primitive Triangulation: Decodes and unwinds complex GPU primitives - including independent triangle listings,
 high-density triangle strips, and triangle fans - translating them into uniform 3-element face records (f).
@@ -133,7 +135,9 @@ static void write_mtl_material(FILE *mtl_out, const char *mat_name, const prc_ap
     fprintf(mtl_out, "  Ks %f %f %f\n", mat->specular[0], mat->specular[1], mat->specular[2]);
     fprintf(mtl_out, "  Ka %f %f %f\n", mat->ambient[0], mat->ambient[1], mat->ambient[2]);
     fprintf(mtl_out, "  Ke %f %f %f\n", mat->emissive[0], mat->emissive[1], mat->emissive[2]);
-    fprintf(mtl_out, "  Ns %f\n", mat->shininess);
+    /* PRC shininess runs 0..1, MTL's Ns 0..1000. */
+    fprintf(mtl_out, "  Ns %f\n", mat->shininess <= 0.0f ? 0.0f
+        : (mat->shininess >= 1.0f ? 1000.0f : mat->shininess * 1000.0f));
     fprintf(mtl_out, "  d %f\n", mat->diffuse_alpha);
 
     if (texture_filename && strlen(texture_filename) > 0)
@@ -310,16 +314,35 @@ static int transform_mirrors(const prc_api_transform *xform)
 }
 
 /**
- * @brief The colour a vertex is drawn with, apart from the material's diffuse
- * colour, as nanoPRC's viewer demo shades it. Where the face styles each
- * vertex (prc_api_vertices_have_material) that is the vertex's own diffuse
- * colour, and the face's material is not used; otherwise it is the vertex
- * colour, which the material's diffuse colour then multiplies, so the MTL
- * keeps that as Kd.
+ * @brief How a face's vertices are coloured, as nanoPRC's reader and viewer
+ * demo draw them. Where the face styles each vertex
+ * (prc_api_vertices_have_material) a vertex is drawn in its own diffuse
+ * colour and the face's material is not used. Otherwise it is drawn in its
+ * vertex colour times the material's diffuse colour, or in its vertex colour
+ * alone when the face has no material. The reader gives every vertex a
+ * colour, also when the file stores none: white, or the colour of the
+ * item's style.
  */
-static const float *vertex_color(const prc_api_vertex *v, int per_vertex_material)
+typedef struct
 {
-    return per_vertex_material ? v->diffuse : v->color;
+    int per_vertex_material;
+    const prc_api_material *material;   /* the face's or tessellation's, or NULL */
+    int with_color;                     /* the colours vary, so each vertex's is written */
+} face_shading;
+
+static void effective_color(const prc_api_vertex *v, const face_shading *shade, float out[3])
+{
+    for (int c = 0; c < 3; c++)
+    {
+        if (shade->per_vertex_material)
+        {
+            out[c] = v->diffuse[c];
+        }
+        else
+        {
+            out[c] = v->color[c] * (shade->material ? shade->material->diffuse[c] : 1.0f);
+        }
+    }
 }
 
 /**
@@ -328,7 +351,7 @@ static const float *vertex_color(const prc_api_vertex *v, int per_vertex_materia
  * moved into place by xform; mirror swaps its last two corners (see transform_mirrors).
  */
 static void process_and_write_obj_triangle(FILE* obj_out, prc_api_vertex v1, prc_api_vertex v2, prc_api_vertex v3,
-    const prc_api_transform *xform, int mirror, int with_color, int per_vertex_material,
+    const prc_api_transform *xform, int mirror, const face_shading *shade,
     uint32_t* v_count, uint32_t* vt_count, uint32_t* vn_count)
 {
     if (mirror)
@@ -368,14 +391,16 @@ static void process_and_write_obj_triangle(FILE* obj_out, prc_api_vertex v1, prc
     uint32_t vn_idx = *vn_count;
 
     /* 1. Write vertex spatial coordinates, and the colour after them when the
-     *    tessellation's colours vary (see tess_colors_vary and vertex_color). */
+     *    face's colours vary (see face_shading). */
     {
         const prc_api_vertex *vs[3] = { &v1, &v2, &v3 };
         for (int c = 0; c < 3; c++)
         {
-            if (with_color)
+            if (shade->with_color)
             {
-                const float *rgb = vertex_color(vs[c], per_vertex_material);
+                /* The colour Kd then multiplies, as the reader does (see
+                   face_shading): written as stored, it comes back exact. */
+                const float *rgb = shade->per_vertex_material ? vs[c]->diffuse : vs[c]->color;
 
                 fprintf(obj_out, "v %f %f %f %f %f %f\n",
                     vs[c]->position[0], vs[c]->position[1], vs[c]->position[2],
@@ -450,41 +475,30 @@ static void process_and_write_obj_triangle(FILE* obj_out, prc_api_vertex v1, prc
 }
 
 /**
- * @brief 1 if the vertices of a surface tessellation are not all drawn with
- * the same colour (see vertex_color). The reader gives every vertex a colour
- * even when the file stores none, so a uniform colour adds nothing the
- * material does not already say, and only varying colours are written.
+ * @brief 1 if a face's vertices are not all drawn in the same colour (see
+ * face_shading), with uniform set to white for the face's Kd. Otherwise 0,
+ * with that one colour in uniform.
  */
-static int tess_colors_vary(prc_context *ctx, const prc_api_tess *tess)
+static int face_colors_vary(const prc_api_tess_vertex_buffer *buf, const face_shading *shade, float uniform[3])
 {
-    const float *first = NULL;
-    uint32_t nbufs = (tess->type == PRC_API_TESS_3D_Compressed) ? 1 : tess->num_faces;
+    float first[3] = { 1.0f, 1.0f, 1.0f };
 
-    for (uint32_t b = 0; b < nbufs; b++)
+    uniform[0] = uniform[1] = uniform[2] = 1.0f;
+    for (uint32_t k = 0; k < buf->num_vertices; k++)
     {
-        const prc_api_tess_vertex_buffer *buf = (tess->type == PRC_API_TESS_3D_Compressed)
-            ? &tess->tess_vertices : &tess->tess_faces[b].face_vertices;
-        int per_vertex_material;
+        float c[3];
 
-        if (!buf->vertices)
+        effective_color(&buf->vertices[k], shade, c);
+        if (k == 0)
         {
-            continue;
+            memcpy(first, c, sizeof(c));
         }
-        per_vertex_material = prc_api_vertices_have_material(ctx, tess, b) ? 1 : 0;
-        for (uint32_t k = 0; k < buf->num_vertices; k++)
+        else if (c[0] != first[0] || c[1] != first[1] || c[2] != first[2])
         {
-            const float *c = vertex_color(&buf->vertices[k], per_vertex_material);
-
-            if (!first)
-            {
-                first = c;
-            }
-            else if (c[0] != first[0] || c[1] != first[1] || c[2] != first[2])
-            {
-                return 1;
-            }
+            return 1;   /* uniform stays white: the colours go with the vertices */
         }
     }
+    memcpy(uniform, first, sizeof(first));
     return 0;
 }
 
@@ -542,8 +556,7 @@ int main(int argc, char *argv[])
     instance_list instances = { NULL, 0, 0 };
     uint8_t *tess_drawn = NULL;
     uint8_t *materials_written = NULL;
-    uint8_t *tess_colored = NULL;   /* 1 where tess_colors_vary */
-    uint32_t colored_count = 0;
+    uint32_t colored_count = 0;     /* faces written with vertex colours */
 
     /* Deduplication Tracking Registry */
     TrackedTexture *tracked_textures = NULL;
@@ -638,8 +651,7 @@ int main(int argc, char *argv[])
     {
         tess_drawn = calloc(total_tessellations, 1);
         materials_written = calloc(total_tessellations, 1);
-        tess_colored = calloc(total_tessellations, 1);
-        if (!tess_drawn || !materials_written || !tess_colored)
+        if (!tess_drawn || !materials_written)
         {
             fprintf(stderr, "Error: out of memory\n");
             ret = 1;
@@ -666,13 +678,6 @@ int main(int argc, char *argv[])
             (tesses[i].type == PRC_API_TESS_3D || tesses[i].type == PRC_API_TESS_3D_Compressed))
         {
             fprintf(stderr, "Warning: tessellation %u is not drawn by any part; not exported.\n", i);
-        }
-        if (tess_drawn[i] &&
-            (tesses[i].type == PRC_API_TESS_3D || tesses[i].type == PRC_API_TESS_3D_Compressed) &&
-            tess_colors_vary(ctx, &tesses[i]))
-        {
-            tess_colored[i] = 1;
-            colored_count++;
         }
     }
 
@@ -704,7 +709,6 @@ int main(int argc, char *argv[])
         const prc_api_transform *xform = &instances.items[n].xform;
         int mirror = transform_mirrors(xform);
         int write_materials = !materials_written[i];
-        int with_color = tess_colored[i];
         prc_api_tess *tess = &tesses[i];
         if (tess->type != PRC_API_TESS_3D && tess->type != PRC_API_TESS_3D_Compressed)
         {
@@ -741,8 +745,22 @@ int main(int argc, char *argv[])
                 continue;
             }
 
-            int per_vertex_material = prc_api_vertices_have_material(ctx, tess, (uint32_t)f) ? 1 : 0;
+            face_shading shade;
+            float uniform[3];
             char dynamic_mat_id[128];
+
+            shade.per_vertex_material = prc_api_vertices_have_material(ctx, tess, (uint32_t)f) ? 1 : 0;
+            shade.material = face->is_material ? &face->material : tess->is_material ? &tess->tess_material : NULL;
+            shade.with_color = face_colors_vary(vertex_buf, &shade, uniform);
+            if (shade.with_color && !shade.per_vertex_material && shade.material)
+            {
+                /* Each vertex's own colour goes out with the material's Kd. */
+                memcpy(uniform, shade.material->diffuse, sizeof(uniform));
+            }
+            if (shade.with_color && write_materials)
+            {
+                colored_count++;
+            }
             char texture_local_name[256] = {0};
             snprintf(dynamic_mat_id, sizeof(dynamic_mat_id), "mat_tess_%u_face_%zu", i, f);
 
@@ -823,40 +841,48 @@ int main(int argc, char *argv[])
                 }
             }
 
-            /* Resolve material records. Where each vertex carries its own
-               material, its diffuse colour is written as the vertex colour,
-               so Kd is white: an importer multiplies the two, as the reader
-               multiplies a vertex colour by the material's. */
-            if (!write_materials)
+            /* Resolve material records. Kd is the colour the face is drawn
+               in when that is the same across it. When it varies, each
+               vertex's colour is written and Kd is the material's diffuse
+               colour, white where there is none or where each vertex carries
+               its own material: an importer multiplies the two, as the
+               reader does. The other slots come
+               from the material the face is drawn with: the vertex's own
+               where each vertex carries one, else the face's or the
+               tessellation's, else a plain default. */
+            if (write_materials)
             {
-                /* Written with this tessellation's first instance. */
-            }
-            else if (with_color && per_vertex_material)
-            {
-                prc_api_material white = face->is_material ? face->material
-                    : tess->is_material ? tess->tess_material : (prc_api_material){ .diffuse_alpha = 1.0f };
-                white.diffuse[0] = white.diffuse[1] = white.diffuse[2] = 1.0f;
-                write_mtl_material(mtl_file, dynamic_mat_id, &white, texture_local_name);
-            }
-            else if (face->is_material)
-            {
-                write_mtl_material(mtl_file, dynamic_mat_id, &face->material, texture_local_name);
-            }
-            else if (tess->is_material)
-            {
-                write_mtl_material(mtl_file, dynamic_mat_id, &tess->tess_material, texture_local_name);
-            }
-            else
-            {
-                prc_api_material fallback_mat = {
-                    .diffuse = { 0.80f, 0.80f, 0.80f },
-                    .specular = { 0.25f, 0.25f, 0.25f },
-                    .ambient = { 0.20f, 0.20f, 0.20f },
-                    .emissive = { 0.00f, 0.00f, 0.00f },
-                    .shininess = 32.0f,
-                    .diffuse_alpha = 1.0f
-                };
-                write_mtl_material(mtl_file, dynamic_mat_id, &fallback_mat, texture_local_name);
+                prc_api_material mat;
+
+                if (shade.per_vertex_material)
+                {
+                    const prc_api_vertex *v0 = &vertex_buf->vertices[0];
+
+                    memset(&mat, 0, sizeof(mat));
+                    memcpy(mat.ambient, v0->diffuse, sizeof(mat.ambient));
+                    memcpy(mat.specular, v0->specular, sizeof(mat.specular));
+                    memcpy(mat.emissive, v0->emissive, sizeof(mat.emissive));
+                    mat.shininess = v0->shininess;
+                    mat.diffuse_alpha = v0->alpha;
+                }
+                else if (shade.material)
+                {
+                    mat = *shade.material;
+                }
+                else
+                {
+                    prc_api_material fallback_mat = {
+                        .diffuse = { 1.00f, 1.00f, 1.00f },
+                        .specular = { 0.25f, 0.25f, 0.25f },
+                        .ambient = { 0.20f, 0.20f, 0.20f },
+                        .emissive = { 0.00f, 0.00f, 0.00f },
+                        .shininess = 0.032f,
+                        .diffuse_alpha = 1.0f
+                    };
+                    mat = fallback_mat;
+                }
+                memcpy(mat.diffuse, uniform, sizeof(mat.diffuse));
+                write_mtl_material(mtl_file, dynamic_mat_id, &mat, texture_local_name);
             }
 
             fprintf(obj_file, "usemtl %s\n", dynamic_mat_id);
@@ -885,7 +911,7 @@ int main(int argc, char *argv[])
                                 vertex_buf->vertices[i0],
                                 vertex_buf->vertices[i1],
                                 vertex_buf->vertices[i2],
-                                xform, mirror, with_color, per_vertex_material,
+                                xform, mirror, &shade,
                                 &global_v_counter,
                                 &global_vt_counter,
                                 &global_vn_counter);
@@ -917,7 +943,7 @@ int main(int argc, char *argv[])
                                 vertex_buf->vertices[i0],
                                 vertex_buf->vertices[i1],
                                 vertex_buf->vertices[i2],
-                                xform, mirror, with_color, per_vertex_material,
+                                xform, mirror, &shade,
                                 &global_v_counter,
                                 &global_vt_counter,
                                 &global_vn_counter);
@@ -939,7 +965,7 @@ int main(int argc, char *argv[])
                                 vertex_buf->vertices[i0],
                                 vertex_buf->vertices[i1],
                                 vertex_buf->vertices[i2],
-                                xform, mirror, with_color, per_vertex_material,
+                                xform, mirror, &shade,
                                 &global_v_counter,
                                 &global_vt_counter,
                                 &global_vn_counter);
@@ -951,7 +977,7 @@ int main(int argc, char *argv[])
     }
 
     printf("OBJ export completed successfully. Unique textures written: %zu. Total vertices: %u. "
-           "Tessellations with vertex colours: %u\n",
+           "Faces with vertex colours: %u\n",
            tracked_count, global_v_counter - 1, colored_count);
 
 cleanup:
@@ -962,7 +988,6 @@ cleanup:
     free(instances.items);
     free(tess_drawn);
     free(materials_written);
-    free(tess_colored);
     if (obj_file)
     {
         fclose(obj_file);
