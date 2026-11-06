@@ -29,6 +29,13 @@ nano_prc_obj_import <input.obj> [output.prc] [output.pdf]
   `refl -type sphere` image a reflection (at the strength `Ks` gives), each applied after the
   diffuse texture, or on its own when there is none. Other map options are ignored, and map types
   PRC has no place for (bump, specular, emissive, cube reflections) are left out.
+- MTL libraries and texture images are only ever read from the OBJ's folder and its subfolders. A
+  plain relative path down from the OBJ (`tex/wood.png`) is used as written. Any other path, such as
+  `C:\Users\me\Desktop\wood.png` from another machine or `../shared/wood.png`, is reduced to its
+  file name, which is looked for in the OBJ's folder and then in its subfolders, nearest first (four
+  levels down at most, alphabetically within a folder, an exact name before one that differs only
+  in letter case). Each substitution is reported, and an image not found that way is left out.
+  Links are not followed.
 - Geometry is written as PRC compressed tessellation, textured or not. `--triangles` writes plain
   triangles instead.
 - `--quant-tolerance` sets the compressed encoding's tolerance as a fraction of the bounding-box
@@ -47,7 +54,9 @@ git submodule.
 nano_prc_obj_export <input.pdf|input.prc> <output.obj>
 ```
 
-Writes OBJ, MTL and PNG texture files, de-duplicating identical textures.
+Writes OBJ, MTL and PNG texture files, de-duplicating identical textures. A texture larger than
+2^28 bytes, or with other than 1 to 4 channels, is not written: the PNG writer, stb_image_write
+v1.16, does not check its size arithmetic (CVE-2026-102805).
 
 ## Building
 

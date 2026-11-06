@@ -98,6 +98,19 @@ folder or execution will fail during asset serialization. Existing files are ove
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
+/* stb_image_write v1.16 computes image sizes in int without checking them
+   (CVE-2026-102805), and a texture's width, height and channels come from
+   the PRC file. A texture is written only when they are sensible and the
+   image is at most 2^28 bytes, far inside int. */
+#define OBJ_EXPORT_MAX_TEXTURE_BYTES (1u << 28)
+
+static int texture_fits_png(uint32_t width, uint32_t height, uint32_t channels)
+{
+    if (width == 0 || height == 0 || channels < 1 || channels > 4)
+        return 0;
+    return (uint64_t)width * height * channels <= OBJ_EXPORT_MAX_TEXTURE_BYTES;
+}
+
 /**
  * @brief Structure to track unique texture assets to optimize disk operations
  * and avoid writing duplicate image files.
@@ -802,7 +815,16 @@ int main(int argc, char *argv[])
                              "%.*s_tex_%u_%zu.png",
                              (int)(sizeof(texture_local_name) - 41), stem_filename, i, f);
 
-                    int write_ok = stbi_write_png(texture_full_path,
+                    int fits = texture_fits_png(face->texture.width, face->texture.height,
+                                                face->texture.num_channels);
+                    int write_ok;
+
+                    if (!fits)
+                        fprintf(stderr, "Warning: texture of %ux%u with %u channels is not written "
+                                "(too large, or not 1 to 4 channels)\n",
+                                (unsigned)face->texture.width, (unsigned)face->texture.height,
+                                (unsigned)face->texture.num_channels);
+                    write_ok = fits && stbi_write_png(texture_full_path,
                                                  (int)face->texture.width,
                                                  (int)face->texture.height,
                                                  (int)face->texture.num_channels,

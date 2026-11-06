@@ -41,6 +41,9 @@ SOFTWARE.
 - Source: https://github.com/nothings/stb
 - Licence: public domain (Unlicense) or MIT, at the user's choice. The full text is at the end of the
   header file.
+- Known, and unfixed upstream: CVE-2026-102805, unchecked size arithmetic in `stbi_write_png_to_mem`
+  and the JPEG and TGA writers. `obj_export` writes a texture only when its width, height and
+  channels are sensible and the image is at most 2^28 bytes.
 
 ## nanoPRC
 

@@ -7,6 +7,7 @@ set(CMAKE_C_STANDARD 99)
 # file is compiled here instead.
 add_executable(nano_prc_obj_import
                src/obj_import.c
+               src/model_path.c
                ${FAST_OBJ_DIR}/fast_obj.c)
 
 target_link_libraries(nano_prc_obj_import PRIVATE nano_prc)

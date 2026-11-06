@@ -43,6 +43,15 @@
  * fast_obj v1.3 ignores a map line that has options and never reads refl,
  * so the MTL files are read a second time here for those (read_mtl_extras).
  *
+ * MTL libraries and texture images are found with model_path_resolve,
+ * never by joining the OBJ's folder to the name in the file: a name such
+ * as "../../x.png" would reach outside that folder, and one such as
+ * "C:\Users\me\x.png", common in OBJ files, is not found as written. A
+ * name that is not a plain path down from the OBJ's folder is looked for
+ * by its file name in that folder and its subfolders, and the
+ * substitution is reported. fast_obj's own file opening goes through the
+ * same lookup (open_beside_obj).
+ *
  * Geometry goes out as compressed tessellation, textured or not.
  * --triangles writes every part as plain triangles instead.
  *
@@ -59,6 +68,8 @@
 
 #include <prc_api.h>
 #include <fast_obj.h>
+
+#include "model_path.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -359,15 +370,29 @@ image_format(const uint8_t *b, size_t n, uint32_t *format, uint32_t *w, uint32_t
     return -1;
 }
 
-/* Read a texture image and check that it is PNG or JPEG. `what` names the
-   map in the warning given when it is missing or of another kind. */
+/* Find the texture image the material names as ref, within the OBJ's
+   folder (model_path_resolve), read it and check that it is PNG or JPEG.
+   `what` names the map in the warnings. */
 static int
-load_image(const char *path, const char *what, uint8_t **bytes, size_t *size,
-    uint32_t *format, uint32_t *w, uint32_t *h)
+load_image(const char *obj_path, const char *ref, const char *what, uint8_t **bytes,
+    size_t *size, uint32_t *format, uint32_t *w, uint32_t *h)
 {
+    char note[1024];
+    char *path = NULL;
+    int r = model_path_resolve(obj_path, ref, &path, note, sizeof(note));
+
+    if (r == MODEL_PATH_NOT_FOUND || r == MODEL_PATH_NO_MEMORY)
+    {
+        if (r == MODEL_PATH_NOT_FOUND)
+            fprintf(stderr, "warning: %s %s; left out\n", what, note);
+        return -1;
+    }
+    if (r == MODEL_PATH_SUBSTITUTED)
+        fprintf(stderr, "warning: %s %s\n", what, note);
     if (read_file(path, bytes, size) != 0)
     {
-        fprintf(stderr, "warning: %s %s not found, left out\n", what, path);
+        fprintf(stderr, "warning: %s %s cannot be read, left out\n", what, path);
+        free(path);
         return -1;
     }
     if (image_format(*bytes, *size, format, w, h) != 0)
@@ -375,8 +400,10 @@ load_image(const char *path, const char *what, uint8_t **bytes, size_t *size,
         fprintf(stderr, "warning: %s %s is not PNG or JPEG, left out\n", what, path);
         free(*bytes);
         *bytes = NULL;
+        free(path);
         return -1;
     }
+    free(path);
     return 0;
 }
 
@@ -387,7 +414,8 @@ load_image(const char *path, const char *what, uint8_t **bytes, size_t *size,
 /* One texture map line: its image, and the options PRC can carry. */
 typedef struct
 {
-    char  *path;            /* NULL when the material has no such map */
+    char  *path;            /* the file name as the MTL gives it, resolved
+                               when loaded; NULL when there is no such map */
     double scale[2];        /* -s u v; 1 1 when not given */
     double offset[2];       /* -o u v; 0 0 when not given */
     int    clamp;           /* -clamp on */
@@ -643,9 +671,10 @@ mtl_extras_find(const mtl_extras *x, const char *name)
 }
 
 /* Read one MTL file for what fast_obj leaves out. A missing file is not an
-   error here: fast_obj has already reported on the materials it found. */
+   error here: fast_obj has already reported on the materials it found. Map
+   file names are kept as the MTL gives them, and resolved when loaded. */
 static int
-read_mtl_file(const char *path, const char *base, mtl_extras *x)
+read_mtl_file(const char *path, mtl_extras *x)
 {
     FILE *f = fopen(path, "rb");
     char *line = NULL;
@@ -690,12 +719,12 @@ read_mtl_file(const char *path, const char *base, mtl_extras *x)
         else if (after_keyword(line, "Ns") != NULL)
             cur->has_Ns = 1;
         else if ((v = after_keyword(line, "map_Kd")) != NULL)
-            parse_map(v, base, &cur->map_Kd, NULL, 0);
+            parse_map(v, "", &cur->map_Kd, NULL, 0);
         else if ((v = after_keyword(line, "map_d")) != NULL)
-            parse_map(v, base, &cur->map_d, NULL, 0);
+            parse_map(v, "", &cur->map_d, NULL, 0);
         else if ((v = after_keyword(line, "refl")) != NULL)
         {
-            if (parse_map(v, base, &cur->refl, type, sizeof(type)) == 0 && strcmp(type, "sphere") != 0)
+            if (parse_map(v, "", &cur->refl, type, sizeof(type)) == 0 && strcmp(type, "sphere") != 0)
             {
                 fprintf(stderr, "warning: material %s: only \"refl -type sphere\" is supported, "
                         "reflection map left out\n", cur->name ? cur->name : "(unnamed)");
@@ -709,46 +738,46 @@ read_mtl_file(const char *path, const char *base, mtl_extras *x)
     return r < 0 ? -1 : 0;
 }
 
-/* Find the OBJ's mtllib lines and read each library. Paths are taken from
-   the OBJ's directory, as fast_obj takes them. */
+/* Find the OBJ's mtllib lines and read each library, found within the OBJ's
+   folder by model_path_resolve. This pass reports a library found by name or
+   not found; fast_obj, reading the same lines, finds the same file quietly. */
 static int
 read_mtl_extras(const char *obj_path, mtl_extras *x)
 {
-    const char *slash = strrchr(obj_path, '/');
-    const char *bslash = strrchr(obj_path, '\\');
-    char *base;
-    size_t nb;
     FILE *f;
     char *line = NULL;
     size_t cap = 0;
     int r, rc = 0;
 
-    if (bslash > slash)
-        slash = bslash;
-    nb = slash != NULL ? (size_t)(slash - obj_path + 1) : 0;
-    base = (char *)malloc(nb + 1);
-    if (base == NULL)
-        return -1;
-    memcpy(base, obj_path, nb);
-    base[nb] = '\0';
-
     f = fopen(obj_path, "rb");
     if (f == NULL)
-    {
-        free(base);
         return 0;
-    }
     while ((r = read_line(f, &line, &cap)) == 1)
     {
         const char *v = after_keyword(line, "mtllib");
-        char *lib;
+        char note[1024];
+        char *ref, *lib = NULL;
+        int found;
 
         if (v == NULL)
             continue;
-        lib = rest_of_line(base, v);
-        if (lib != NULL)
+        ref = rest_of_line("", v);
+        if (ref == NULL)
+            continue;
+        found = model_path_resolve(obj_path, ref, &lib, note, sizeof(note));
+        free(ref);
+        if (found == MODEL_PATH_NO_MEMORY)
         {
-            if (read_mtl_file(lib, base, x) != 0)
+            rc = -1;
+            break;
+        }
+        if (found == MODEL_PATH_NOT_FOUND)
+            fprintf(stderr, "warning: mtllib %s\n", note);
+        else
+        {
+            if (found == MODEL_PATH_SUBSTITUTED)
+                fprintf(stderr, "warning: mtllib %s\n", note);
+            if (read_mtl_file(lib, x) != 0)
                 rc = -1;
             free(lib);
         }
@@ -757,8 +786,94 @@ read_mtl_extras(const char *obj_path, mtl_extras *x)
         rc = -1;
     free(line);
     fclose(f);
-    free(base);
     return rc;
+}
+
+/* fast_obj's file access, routed through model_path_resolve. fast_obj opens
+   the OBJ by the path it was given, and every other file (its mtllib
+   libraries) as the OBJ's folder followed by the name in the file, with the
+   separators made the system's own; that folder is taken off again here and
+   the name resolved like any other. */
+typedef struct
+{
+    const char *obj_path;
+    size_t      folder_len;      /* the OBJ path's folder part, with its separator */
+} obj_files;
+
+static void *
+open_beside_obj(const char *path, void *user)
+{
+    const obj_files *of = (const obj_files *)user;
+    char *found = NULL;
+    FILE *f;
+    size_t k;
+
+    if (strcmp(path, of->obj_path) == 0)
+        return fopen(path, "rb");
+    for (k = 0; k < of->folder_len; k++)
+    {
+        char a = path[k], b = of->obj_path[k];
+
+        if (a == '\\')
+            a = '/';
+        if (b == '\\')
+            b = '/';
+        if (a != b)
+            return NULL;
+    }
+    if (model_path_resolve(of->obj_path, path + of->folder_len, &found, NULL, 0) < 0)
+        return NULL;
+    f = fopen(found, "rb");
+    free(found);
+    return f;
+}
+
+static void
+close_file(void *file, void *user)
+{
+    (void)user;
+    fclose((FILE *)file);
+}
+
+static size_t
+read_bytes(void *file, void *dst, size_t bytes, void *user)
+{
+    (void)user;
+    return fread(dst, 1, bytes, (FILE *)file);
+}
+
+static unsigned long
+size_of_file(void *file, void *user)
+{
+    FILE *f = (FILE *)file;
+    long here = ftell(f), end;
+
+    (void)user;
+    if (here < 0 || fseek(f, 0, SEEK_END) != 0)
+        return 0;
+    end = ftell(f);
+    fseek(f, here, SEEK_SET);
+    return end < 0 ? 0 : (unsigned long)end;
+}
+
+/* fast_obj_read, with every file opened through open_beside_obj. */
+static fastObjMesh *
+read_obj(const char *obj_path)
+{
+    fastObjCallbacks cb;
+    obj_files of;
+    const char *slash = strrchr(obj_path, '/');
+    const char *bslash = strrchr(obj_path, '\\');
+
+    if (bslash > slash)
+        slash = bslash;
+    of.obj_path = obj_path;
+    of.folder_len = slash != NULL ? (size_t)(slash - obj_path + 1) : 0;
+    cb.file_open = open_beside_obj;
+    cb.file_close = close_file;
+    cb.file_read = read_bytes;
+    cb.file_size = size_of_file;
+    return fast_obj_read_with_callbacks(obj_path, &cb, &of);
 }
 
 static uint8_t
@@ -988,7 +1103,7 @@ main(int argc, char *argv[])
     if (prc_path == NULL || pdf_path == NULL)
         goto done;
 
-    mesh = fast_obj_read(in_path);
+    mesh = read_obj(in_path);
     if (mesh == NULL)
     {
         fprintf(stderr, "Could not read %s\n", in_path);
@@ -1172,10 +1287,12 @@ main(int argc, char *argv[])
             maps[0] = (mx != NULL && mx->map_Kd.path != NULL) ? &mx->map_Kd : NULL;
             maps[1] = (mx != NULL && mx->map_d.path != NULL) ? &mx->map_d : NULL;
             maps[2] = (mx != NULL && mx->refl.path != NULL) ? &mx->refl : NULL;
+            /* fast_obj's texture name, not its path: the path is the OBJ's
+               folder joined to the name, which load_image must not trust. */
             paths[0] = maps[0] ? maps[0]->path
-                : ((m->map_Kd != 0) ? mesh->textures[m->map_Kd].path : NULL);
+                : ((m->map_Kd != 0) ? mesh->textures[m->map_Kd].name : NULL);
             paths[1] = maps[1] ? maps[1]->path
-                : ((m->map_d != 0) ? mesh->textures[m->map_d].path : NULL);
+                : ((m->map_d != 0) ? mesh->textures[m->map_d].name : NULL);
             paths[2] = maps[2] ? maps[2]->path : NULL;
 
             /* MTL scales a reflection map by Ks. With no Ks it applies in full. */
@@ -1195,7 +1312,7 @@ main(int argc, char *argv[])
                 uint32_t fmt = 0, w = 0, h = 0;
 
                 if (paths[j] == NULL ||
-                    load_image(paths[j], names[j], &bytes, &size, &fmt, &w, &h) != 0)
+                    load_image(in_path, paths[j], names[j], &bytes, &size, &fmt, &w, &h) != 0)
                     continue;
                 if (!want_texture)
                 {
