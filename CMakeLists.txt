@@ -35,6 +35,14 @@ if(NOT TARGET nano_prc)
                           RUNTIME_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
 endif()
 
+# A function called before it is declared is an implicit declaration, which
+# C99 removed: GCC and Clang refuse it, but MSVC only warns (C4013) and the
+# build goes on. Make that warning an error here too, for this repository's
+# own targets; nanoPRC's, added above, are not affected.
+if(MSVC)
+    add_compile_options(/we4013)
+endif()
+
 set(FAST_OBJ_DIR "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/fast_obj" CACHE PATH
     "Path to the fast_obj sources (git submodule thirdparty/fast_obj)")
 
