@@ -138,10 +138,34 @@ typedef struct {
     } while (0)
 
 /**
- * @brief Helper to write a material entry into the companion .mtl file descriptor,
- * supporting optional diffuse texture maps via map_Kd.
+ * @brief 1 if a texture has an alpha channel (2 or 4 channels) that is not
+ * opaque everywhere. Labels are often drawn this way: black glyphs on an
+ * otherwise clear image, which drawn opaque cover what lies behind them.
  */
-static void write_mtl_material(FILE *mtl_out, const char *mat_name, const prc_api_material *mat, const char *texture_filename)
+static int texture_has_alpha(const prc_api_texture *tex)
+{
+    size_t n, k;
+    uint32_t ch = tex->num_channels;
+
+    if (!tex->data || (ch != 2 && ch != 4))
+        return 0;
+    n = (size_t)tex->width * tex->height;
+    for (k = 0; k < n; k++)
+    {
+        if (tex->data[k * ch + ch - 1] != 255)
+            return 1;
+    }
+    return 0;
+}
+
+/**
+ * @brief Helper to write a material entry into the companion .mtl file descriptor,
+ * supporting optional diffuse texture maps via map_Kd. When the texture is
+ * partly clear (alpha), the same image also goes out as map_d, the alpha
+ * map, which importers read from the image's alpha channel.
+ */
+static void write_mtl_material(FILE *mtl_out, const char *mat_name, const prc_api_material *mat,
+    const char *texture_filename, int texture_alpha)
 {
     fprintf(mtl_out, "newmtl %s\n", mat_name);
     fprintf(mtl_out, "  Kd %f %f %f\n", mat->diffuse[0], mat->diffuse[1], mat->diffuse[2]);
@@ -156,6 +180,10 @@ static void write_mtl_material(FILE *mtl_out, const char *mat_name, const prc_ap
     if (texture_filename && strlen(texture_filename) > 0)
     {
         fprintf(mtl_out, "  map_Kd %s\n", texture_filename);
+        if (texture_alpha)
+        {
+            fprintf(mtl_out, "  map_d %s\n", texture_filename);
+        }
     }
     fprintf(mtl_out, "\n");
 }
@@ -200,6 +228,26 @@ static int add_instance(instance_list *l, uint32_t tess, const prc_api_transform
     return 0;
 }
 
+/* PRC_GRAPHICS_Removed (0x2000), as it appears in the high byte of a
+   behaviour field, behavior_bit_field2: a product or item that has been
+   removed and no longer appears. Adobe Acrobat draws neither it nor anything
+   under it (the ten oaks of 3D-PDF-Sample-School in prc-db). */
+#define PRC_REMOVED_BYTE2 0x20
+
+/* tess_drawn values: a part draws the tessellation, or only removed ones do */
+#define TESS_DRAWN 1
+#define TESS_REMOVED_ONLY 2
+
+/* A representation item waiting to be visited, with the transform it is
+   placed by (its product's, then the local coordinate systems of the sets
+   that hold it), and whether it lies under something removed. */
+typedef struct
+{
+    const prc_api_part *item;
+    prc_api_transform xform;
+    int removed;
+} item_visit;
+
 /**
  * @brief Walks the model tree as demos/stl_export in nanoPRC does, composing
  * each product's own placement (prc_api_product::location) after its
@@ -208,21 +256,32 @@ static int add_instance(instance_list *l, uint32_t tess, const prc_api_transform
  *
  * A part's geometry is on the part itself or on its representation items,
  * which can nest in sets to a depth the file chooses, so those are visited
- * from an explicit stack. Tessellations are looked up by part_detail_index,
- * the API's numbering, which differs from the file's wherever parts share a
- * file tessellation.
+ * from an explicit stack. An item with a local coordinate system
+ * (biased_local_coordinate_index) is placed by it within its parent's frame,
+ * as nanoPRC returns its vertices in that system's frame. Tessellations are
+ * looked up by part_detail_index, the API's numbering, which differs from
+ * the file's wherever parts share a file tessellation.
+ *
+ * A product or item marked removed is not written, nor anything under it;
+ * its tessellations are marked TESS_REMOVED_ONLY unless a part that is not
+ * removed draws them too.
  */
-static int collect_instances(prc_context *ctx, const prc_api_product *node, prc_api_transform parent,
-    uint32_t total_tessellations, instance_list *out, uint8_t *tess_drawn)
+static int collect_instances(prc_context *ctx, prc_api_data data, const prc_api_product *node,
+    prc_api_transform parent, int removed, uint32_t total_tessellations, instance_list *out,
+    uint8_t *tess_drawn)
 {
     prc_api_transform world = parent;
     size_t k;
 
+    if (node->behavior_bit_field2 & PRC_REMOVED_BYTE2)
+    {
+        removed = 1;
+    }
     prc_api_update_transform(ctx, &world, (prc_api_transform *)&node->location);
 
     if (node->part)
     {
-        const prc_api_part **stack;
+        item_visit *stack;
         size_t depth = 0, capacity = 16;
 
         stack = malloc(capacity * sizeof(*stack));
@@ -230,44 +289,74 @@ static int collect_instances(prc_context *ctx, const prc_api_product *node, prc_
         {
             return -1;
         }
-        stack[depth++] = node->part;
+        stack[depth].item = node->part;
+        stack[depth].xform = world;
+        stack[depth++].removed = removed;
         while (depth > 0)
         {
-            const prc_api_part *item = stack[--depth];
+            item_visit v = stack[--depth];
+            const prc_api_part *item = v.item;
             size_t ri;
 
+            if (item->behavior_bit_field2 & PRC_REMOVED_BYTE2)
+            {
+                v.removed = 1;
+            }
+            if (item->biased_local_coordinate_index != 0)
+            {
+                prc_api_transform own;
+
+                if (prc_api_get_local_coordinate_system(ctx, data, item->tess_file_index,
+                        item->biased_local_coordinate_index, &own) == 0)
+                {
+                    prc_api_update_transform(ctx, &v.xform, &own);
+                }
+            }
             if (item->biased_tess_index > 0 && item->part_detail_index < total_tessellations)
             {
-                if (add_instance(out, item->part_detail_index, &world) != 0)
+                if (v.removed)
                 {
-                    free((void *)stack);
-                    return -1;
+                    if (tess_drawn[item->part_detail_index] == 0)
+                    {
+                        tess_drawn[item->part_detail_index] = TESS_REMOVED_ONLY;
+                    }
                 }
-                tess_drawn[item->part_detail_index] = 1;
+                else
+                {
+                    if (add_instance(out, item->part_detail_index, &v.xform) != 0)
+                    {
+                        free(stack);
+                        return -1;
+                    }
+                    tess_drawn[item->part_detail_index] = TESS_DRAWN;
+                }
             }
             for (ri = item->num_rep_items; ri > 0; ri--)
             {
                 if (depth == capacity)
                 {
-                    const prc_api_part **grown = realloc((void *)stack, capacity * 2 * sizeof(*stack));
+                    item_visit *grown = realloc(stack, capacity * 2 * sizeof(*stack));
 
                     if (!grown)
                     {
-                        free((void *)stack);
+                        free(stack);
                         return -1;
                     }
                     stack = grown;
                     capacity *= 2;
                 }
-                stack[depth++] = &item->rep_items[ri - 1];
+                stack[depth].item = &item->rep_items[ri - 1];
+                stack[depth].xform = v.xform;
+                stack[depth++].removed = v.removed;
             }
         }
-        free((void *)stack);
+        free(stack);
     }
 
     for (k = 0; k < node->num_children; k++)
     {
-        if (collect_instances(ctx, &node->children[k], world, total_tessellations, out, tess_drawn) != 0)
+        if (collect_instances(ctx, data, &node->children[k], world, removed, total_tessellations, out,
+                tess_drawn) != 0)
         {
             return -1;
         }
@@ -276,15 +365,18 @@ static int collect_instances(prc_context *ctx, const prc_api_product *node, prc_
 }
 
 /**
- * @brief Applies a transform's linear (3x3) part to a normal and renormalises.
- * Exact for rotations, mirrors and uniform scale; under non-uniform scale or
- * shear a normal strictly needs the inverse transpose, which is not attempted
- * (as in nanoPRC's demos/stl_export). Positions are always exact.
+ * @brief Moves a normal into place by a transform and renormalises. A normal
+ * takes the cofactor matrix of the transform's linear (3x3) part: its inverse
+ * transpose times its determinant, so with the determinant's sign it points
+ * the same way and stays perpendicular to the surface under non-uniform
+ * scale and shear too (local coordinate systems do scale unevenly).
  */
 static void transform_normal(const prc_api_transform *xform, const float in[3], float out[3])
 {
     const double *m;
+    double c[9], det;
     float len;
+    int i;
 
     if (xform->is_identity)
     {
@@ -292,9 +384,27 @@ static void transform_normal(const prc_api_transform *xform, const float in[3], 
         return;
     }
     m = xform->matrix;
-    out[0] = (float)(m[0] * in[0] + m[4] * in[1] + m[8]  * in[2]);
-    out[1] = (float)(m[1] * in[0] + m[5] * in[1] + m[9]  * in[2]);
-    out[2] = (float)(m[2] * in[0] + m[6] * in[1] + m[10] * in[2]);
+    /* c is column-major, as m is */
+    c[0] = m[5] * m[10] - m[6] * m[9];
+    c[1] = m[6] * m[8] - m[4] * m[10];
+    c[2] = m[4] * m[9] - m[5] * m[8];
+    c[3] = m[9] * m[2] - m[10] * m[1];
+    c[4] = m[10] * m[0] - m[8] * m[2];
+    c[5] = m[8] * m[1] - m[9] * m[0];
+    c[6] = m[1] * m[6] - m[2] * m[5];
+    c[7] = m[2] * m[4] - m[0] * m[6];
+    c[8] = m[0] * m[5] - m[1] * m[4];
+    det = m[0] * c[0] + m[4] * c[3] + m[8] * c[6];
+    if (det < 0.0)
+    {
+        for (i = 0; i < 9; i++)
+        {
+            c[i] = -c[i];
+        }
+    }
+    out[0] = (float)(c[0] * in[0] + c[3] * in[1] + c[6] * in[2]);
+    out[1] = (float)(c[1] * in[0] + c[4] * in[1] + c[7] * in[2]);
+    out[2] = (float)(c[2] * in[0] + c[5] * in[1] + c[8] * in[2]);
     len = sqrtf(out[0] * out[0] + out[1] * out[1] + out[2] * out[2]);
     if (len > 1e-7f)
     {
@@ -675,7 +785,8 @@ int main(int argc, char *argv[])
     {
         prc_api_transform root_transform;
         prc_api_set_transform_identity(ctx, &root_transform);
-        if (collect_instances(ctx, model_tree, root_transform, total_tessellations, &instances, tess_drawn) != 0)
+        if (collect_instances(ctx, data, model_tree, root_transform, 0, total_tessellations, &instances,
+                tess_drawn) != 0)
         {
             fprintf(stderr, "Error: out of memory\n");
             ret = 1;
@@ -684,13 +795,31 @@ int main(int argc, char *argv[])
     }
 
     /* A surface tessellation that no part draws is reported, not written.
-       Adobe Acrobat does not draw one either. */
-    for (uint32_t i = 0; i < total_tessellations; i++)
+       Adobe Acrobat does not draw one either. Nor one only removed products
+       or items draw: those are counted. */
     {
-        if (!tess_drawn[i] &&
-            (tesses[i].type == PRC_API_TESS_3D || tesses[i].type == PRC_API_TESS_3D_Compressed))
+        uint32_t removed_only = 0;
+
+        for (uint32_t i = 0; i < total_tessellations; i++)
         {
-            fprintf(stderr, "Warning: tessellation %u is not drawn by any part; not exported.\n", i);
+            if (tess_drawn[i] == TESS_DRAWN ||
+                (tesses[i].type != PRC_API_TESS_3D && tesses[i].type != PRC_API_TESS_3D_Compressed))
+            {
+                continue;
+            }
+            if (tess_drawn[i] == TESS_REMOVED_ONLY)
+            {
+                removed_only++;
+            }
+            else
+            {
+                fprintf(stderr, "Warning: tessellation %u is not drawn by any part; not exported.\n", i);
+            }
+        }
+        if (removed_only > 0)
+        {
+            printf("%u tessellation(s) left out: only products or items marked removed draw them.\n",
+                (unsigned)removed_only);
         }
     }
 
@@ -904,7 +1033,8 @@ int main(int argc, char *argv[])
                     mat = fallback_mat;
                 }
                 memcpy(mat.diffuse, uniform, sizeof(mat.diffuse));
-                write_mtl_material(mtl_file, dynamic_mat_id, &mat, texture_local_name);
+                write_mtl_material(mtl_file, dynamic_mat_id, &mat, texture_local_name,
+                    texture_local_name[0] != '\0' && texture_has_alpha(&face->texture));
             }
 
             fprintf(obj_file, "usemtl %s\n", dynamic_mat_id);
